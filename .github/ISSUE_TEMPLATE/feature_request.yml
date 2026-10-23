@@ -1,0 +1,19 @@
+name: Feature request
+description: Propose a workflow or compatibility improvement.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and desired workflow
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Relevant filesystem or Git configuration
+      description: Include platform details when asking for compatibility support.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and tradeoffs
+      description: Distinguish disk-space sharing, final-state validation, and strict write enforcement.

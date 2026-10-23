@@ -1,0 +1,27 @@
+name: Bug report
+description: Report unexpected cloning, Git, scope, or recovery behavior.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Include commands, exit codes, and minimal reproduction steps. Remove credentials and private paths.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include git-thin version or commit, OS, filesystem, Git version, source/destination volumes, and doctor output.
+    validations:
+      required: true
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Worktree and recovery state
+      description: If creation or removal failed, include JSON status or recover --dry-run output. Do not delete evidence or user data to reproduce a failure.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      render: text

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify macOS test filesystem
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          device=$(df -P "$RUNNER_TEMP" | tail -1 | awk '{print $1}')
+          diskutil info -plist "$device" | python3 -c 'import plistlib,sys; info=plistlib.load(sys.stdin.buffer); assert info.get("FilesystemType") == "apfs", info'
+          diskutil info "$device"
+      - name: Prepare separate APFS volume for cross-volume rejection
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/git-thin-cross-volume"
+          hdiutil create -quiet -size 256m -type SPARSE -fs APFS -volname GitThinCross "$RUNNER_TEMP/git-thin-cross.sparseimage"
+          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/git-thin-cross-volume" "$RUNNER_TEMP/git-thin-cross.sparseimage"
+          echo "GIT_THIN_CROSS_VOLUME_ROOT=$RUNNER_TEMP/git-thin-cross-volume" >> "$GITHUB_ENV"
+      - name: Prepare disposable APFS volume for real disk exhaustion
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/git-thin-exhaustion-volume"
+          hdiutil create -quiet -size 128m -type SPARSE -fs APFS -volname GitThinExhaustion "$RUNNER_TEMP/git-thin-exhaustion.sparseimage"
+          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/git-thin-exhaustion-volume" "$RUNNER_TEMP/git-thin-exhaustion.sparseimage"
+          echo "GIT_THIN_EXHAUSTION_ROOT=$RUNNER_TEMP/git-thin-exhaustion-volume" >> "$GITHUB_ENV"
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Tests
+        env:
+          TMPDIR: ${{ runner.temp }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            export GIT_THIN_REQUIRE_CLONE=1
+          fi
+          cargo test --locked --all-targets --all-features
+      - name: Release build
+        run: cargo build --locked --release
+      - name: Detach disposable APFS volumes
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ -n "${GIT_THIN_CROSS_VOLUME_ROOT:-}" ]; then
+            hdiutil detach "$GIT_THIN_CROSS_VOLUME_ROOT"
+          fi
+          if [ -n "${GIT_THIN_EXHAUSTION_ROOT:-}" ]; then
+            hdiutil detach "$GIT_THIN_EXHAUSTION_ROOT"
+          fi

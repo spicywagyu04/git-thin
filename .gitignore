@@ -1,0 +1,6 @@
+/target/
+*.dSYM/
+.DS_Store
+/benchmark-results/
+__pycache__/
+*.pyc

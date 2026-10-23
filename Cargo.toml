@@ -1,0 +1,25 @@
+[package]
+name = "git-thin"
+version = "0.1.0"
+edition = "2021"
+description = "Independent Git worktrees with native copy-on-write storage and editing-scope validation"
+license = "MIT"
+rust-version = "1.89"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+
+[[bin]]
+name = "git-thin"
+path = "src/main.rs"
+
+[features]
+fault-injection = []
