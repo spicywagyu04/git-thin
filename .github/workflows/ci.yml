@@ -28,7 +28,7 @@ jobs:
           hdiutil create -quiet -size 1g -type SPARSE -fs APFS -volname GitThinTests "$RUNNER_TEMP/git-thin-tests.sparseimage"
           hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/git-thin-test-volume" "$RUNNER_TEMP/git-thin-tests.sparseimage"
           echo "GIT_THIN_TEST_ROOT=$RUNNER_TEMP/git-thin-test-volume" >> "$GITHUB_ENV"
-          test "$(stat -f %T "$RUNNER_TEMP/git-thin-test-volume")" = apfs
+          diskutil info -plist "$RUNNER_TEMP/git-thin-test-volume" | python3 -c 'import plistlib,sys; info=plistlib.load(sys.stdin.buffer); assert info.get("FilesystemType") == "apfs", info'
       - name: Prepare separate APFS volume for cross-volume rejection
         if: runner.os == 'macOS'
         shell: bash
