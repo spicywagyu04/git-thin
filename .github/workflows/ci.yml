@@ -19,13 +19,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Verify macOS test filesystem
+      - name: Prepare APFS test filesystem
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          device=$(df -P "$RUNNER_TEMP" | tail -1 | awk '{print $1}')
-          diskutil info -plist "$device" | python3 -c 'import plistlib,sys; info=plistlib.load(sys.stdin.buffer); assert info.get("FilesystemType") == "apfs", info'
-          diskutil info "$device"
+          # Hosted runners do not guarantee that RUNNER_TEMP is on APFS.
+          mkdir "$RUNNER_TEMP/git-thin-test-volume"
+          hdiutil create -quiet -size 1g -type SPARSE -fs APFS -volname GitThinTests "$RUNNER_TEMP/git-thin-tests.sparseimage"
+          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/git-thin-test-volume" "$RUNNER_TEMP/git-thin-tests.sparseimage"
+          echo "GIT_THIN_TEST_ROOT=$RUNNER_TEMP/git-thin-test-volume" >> "$GITHUB_ENV"
+          test "$(stat -f %T "$RUNNER_TEMP/git-thin-test-volume")" = apfs
       - name: Prepare separate APFS volume for cross-volume rejection
         if: runner.os == 'macOS'
         shell: bash
@@ -52,6 +55,7 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
+            export TMPDIR="$GIT_THIN_TEST_ROOT"
             export GIT_THIN_REQUIRE_CLONE=1
           fi
           cargo test --locked --all-targets --all-features
@@ -61,6 +65,9 @@ jobs:
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
+          if [ -n "${GIT_THIN_TEST_ROOT:-}" ]; then
+            hdiutil detach "$GIT_THIN_TEST_ROOT"
+          fi
           if [ -n "${GIT_THIN_CROSS_VOLUME_ROOT:-}" ]; then
             hdiutil detach "$GIT_THIN_CROSS_VOLUME_ROOT"
           fi
