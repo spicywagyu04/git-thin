@@ -19,16 +19,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Prepare APFS test filesystem
+      - name: Verify macOS test filesystem
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          # Hosted runners do not guarantee that RUNNER_TEMP is on APFS.
-          mkdir "$RUNNER_TEMP/git-thin-test-volume"
-          hdiutil create -quiet -size 1g -type SPARSE -fs APFS -volname GitThinTests "$RUNNER_TEMP/git-thin-tests.sparseimage"
-          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/git-thin-test-volume" "$RUNNER_TEMP/git-thin-tests.sparseimage"
-          echo "GIT_THIN_TEST_ROOT=$RUNNER_TEMP/git-thin-test-volume" >> "$GITHUB_ENV"
-          diskutil info -plist "$RUNNER_TEMP/git-thin-test-volume" | python3 -c 'import plistlib,sys; info=plistlib.load(sys.stdin.buffer); assert info.get("FilesystemType") == "apfs", info'
+          device=$(df -P "$RUNNER_TEMP" | tail -1 | awk '{print $1}')
+          # plistlib.load() seeks while detecting the format; stdin is a pipe.
+          diskutil info -plist "$device" | python3 -c 'import plistlib,sys; info=plistlib.loads(sys.stdin.buffer.read()); assert info.get("FilesystemType") == "apfs", info'
+          diskutil info "$device"
       - name: Prepare separate APFS volume for cross-volume rejection
         if: runner.os == 'macOS'
         shell: bash
@@ -55,7 +53,6 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
-            export TMPDIR="$GIT_THIN_TEST_ROOT"
             export GIT_THIN_REQUIRE_CLONE=1
           fi
           cargo test --locked --all-targets --all-features
@@ -65,9 +62,6 @@ jobs:
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
-          if [ -n "${GIT_THIN_TEST_ROOT:-}" ]; then
-            hdiutil detach "$GIT_THIN_TEST_ROOT"
-          fi
           if [ -n "${GIT_THIN_CROSS_VOLUME_ROOT:-}" ]; then
             hdiutil detach "$GIT_THIN_CROSS_VOLUME_ROOT"
           fi
