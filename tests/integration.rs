@@ -836,7 +836,16 @@ fn non_utf8_source_paths_are_explicitly_rejected() {
     use std::os::unix::ffi::OsStringExt;
     let repo = Repo::new();
     let name = OsString::from_vec(vec![b'f', 0xff]);
-    fs::write(repo.source.join(name), "non UTF-8 filename").unwrap();
+    // APFS rejects malformed UTF-8 names before source validation can inspect them.
+    if let Err(error) = fs::write(repo.source.join(name), "non UTF-8 filename") {
+        if error.raw_os_error() == Some(libc::EILSEQ) {
+            eprintln!(
+                "SKIP non-UTF-8 source test: filesystem rejects non-UTF-8 filenames: {error}"
+            );
+            return;
+        }
+        panic!("cannot create non-UTF-8 source fixture: {error}");
+    }
     git(&repo.source, &["add", "."]);
     git(&repo.source, &["commit", "-m", "unsupported path encoding"]);
     repo.reject_add(&["non-utf-8", "utf8", "utf-8"]);

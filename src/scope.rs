@@ -814,7 +814,16 @@ mod tests {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
         let (dir, baseline) = repository();
-        fs::write(dir.path().join(OsStr::from_bytes(b"nonutf8-\xff")), "new").unwrap();
+        // APFS rejects malformed UTF-8 names before scope validation can inspect them.
+        if let Err(error) = fs::write(dir.path().join(OsStr::from_bytes(b"nonutf8-\xff")), "new") {
+            if error.raw_os_error() == Some(libc::EILSEQ) {
+                eprintln!(
+                    "SKIP non-UTF-8 scope test: filesystem rejects non-UTF-8 filenames: {error}"
+                );
+                return;
+            }
+            panic!("cannot create non-UTF-8 scope fixture: {error}");
+        }
         assert!(check(dir.path(), &baseline, &allowed(dir.path()))
             .unwrap_err()
             .contains("non-UTF-8"));

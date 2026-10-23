@@ -24,7 +24,8 @@ jobs:
         shell: bash
         run: |
           device=$(df -P "$RUNNER_TEMP" | tail -1 | awk '{print $1}')
-          diskutil info -plist "$device" | python3 -c 'import plistlib,sys; info=plistlib.load(sys.stdin.buffer); assert info.get("FilesystemType") == "apfs", info'
+          # plistlib.load() seeks while detecting the format; stdin is a pipe.
+          diskutil info -plist "$device" | python3 -c 'import plistlib,sys; info=plistlib.loads(sys.stdin.buffer.read()); assert info.get("FilesystemType") == "apfs", info'
           diskutil info "$device"
       - name: Prepare separate APFS volume for cross-volume rejection
         if: runner.os == 'macOS'
