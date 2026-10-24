@@ -7,64 +7,177 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  test:
+  portable:
+    name: Linux ordinary / Rust ${{ matrix.rust }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+        rust: [stable, '1.89.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - name: Build minimum supported Git
+        if: matrix.rust == '1.89.0'
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v2.39.0 https://github.com/git/git.git "$RUNNER_TEMP/git-minimum-source"
+          make -C "$RUNNER_TEMP/git-minimum-source" -j2 prefix="$RUNNER_TEMP/git-minimum" NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
+          echo "$RUNNER_TEMP/git-minimum/bin" >> "$GITHUB_PATH"
+      - name: Record required versions and filesystem
+        shell: bash
+        run: |
+          mkdir "$RUNNER_TEMP/evidence"
+          if [ '${{ matrix.rust }}' = '1.89.0' ]; then
+            python3 scripts/validate_environment.py --git-series 2.39 | tee "$RUNNER_TEMP/evidence/environment.json"
+          else
+            python3 scripts/validate_environment.py | tee "$RUNNER_TEMP/evidence/environment.json"
+          fi
+      - name: Formatting and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Portable tests with explicit unavailable output
+        shell: bash
+        run: |
+          cargo test --locked --all-targets --all-features -- --show-output 2>&1 | tee "$RUNNER_TEMP/evidence/all-features.log"
+          cargo test --locked --all-targets -- --show-output 2>&1 | tee "$RUNNER_TEMP/evidence/production-tests.log"
+      - name: Production build and controls smoke
+        run: |
+          cargo build --locked --release
+          python3 scripts/production_smoke.py target/release/git-thin > "$RUNNER_TEMP/evidence/production-smoke.json"
+      - name: Summarize executed and unavailable coverage
+        if: always()
+        run: python3 scripts/validation_summary.py "$RUNNER_TEMP/evidence" --lane "Linux ordinary / Rust ${{ matrix.rust }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-ordinary-${{ matrix.rust }}-evidence
+          path: ${{ runner.temp }}/evidence
+
+  macos-native:
+    name: macOS native / ${{ matrix.format }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [APFS, APFSX]
+    env:
+      GIT_THIN_REQUIRE_CLONE: '1'
+      GIT_THIN_REQUIRE_VOLUMES: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Verify macOS test filesystem
-        if: runner.os == 'macOS'
+      - name: Prepare dedicated APFS filesystems
         shell: bash
         run: |
-          device=$(df -P "$RUNNER_TEMP" | tail -1 | awk '{print $1}')
-          # plistlib.load() seeks while detecting the format; stdin is a pipe.
-          diskutil info -plist "$device" | python3 -c 'import plistlib,sys; info=plistlib.loads(sys.stdin.buffer.read()); assert info.get("FilesystemType") == "apfs", info'
-          diskutil info "$device"
-      - name: Prepare separate APFS volume for cross-volume rejection
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          mkdir "$RUNNER_TEMP/git-thin-cross-volume"
-          hdiutil create -quiet -size 256m -type SPARSE -fs APFS -volname GitThinCross "$RUNNER_TEMP/git-thin-cross.sparseimage"
-          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/git-thin-cross-volume" "$RUNNER_TEMP/git-thin-cross.sparseimage"
+          mkdir "$RUNNER_TEMP/evidence"
+          filesystem=APFS
+          if [ '${{ matrix.format }}' = APFSX ]; then filesystem='Case-sensitive APFS'; fi
+          for volume in native cross exhaustion; do
+            size=256m
+            if [ "$volume" = native ]; then size=2g; fi
+            if [ "$volume" = exhaustion ]; then size=128m; fi
+            mountpoint="$RUNNER_TEMP/git-thin-$volume-volume"
+            mkdir "$mountpoint"
+            hdiutil create -quiet -size "$size" -type SPARSE -fs "$filesystem" -volname "GitThin-$volume" "$RUNNER_TEMP/git-thin-$volume.sparseimage"
+            hdiutil attach -quiet -nobrowse -mountpoint "$mountpoint" "$RUNNER_TEMP/git-thin-$volume.sparseimage"
+          done
+          echo "TMPDIR=$RUNNER_TEMP/git-thin-native-volume" >> "$GITHUB_ENV"
           echo "GIT_THIN_CROSS_VOLUME_ROOT=$RUNNER_TEMP/git-thin-cross-volume" >> "$GITHUB_ENV"
-      - name: Prepare disposable APFS volume for real disk exhaustion
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          mkdir "$RUNNER_TEMP/git-thin-exhaustion-volume"
-          hdiutil create -quiet -size 128m -type SPARSE -fs APFS -volname GitThinExhaustion "$RUNNER_TEMP/git-thin-exhaustion.sparseimage"
-          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/git-thin-exhaustion-volume" "$RUNNER_TEMP/git-thin-exhaustion.sparseimage"
           echo "GIT_THIN_EXHAUSTION_ROOT=$RUNNER_TEMP/git-thin-exhaustion-volume" >> "$GITHUB_ENV"
-      - name: Formatting
-        run: cargo fmt --all -- --check
-      - name: Lint
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Tests
-        env:
-          TMPDIR: ${{ runner.temp }}
+      - name: Validate native lane capabilities
+        run: python3 scripts/validate_environment.py --filesystem apfs --require-volumes | tee "$RUNNER_TEMP/evidence/environment.json"
+      - name: Required native tests
+        run: |
+          cargo test --locked --all-targets --all-features -- --show-output 2>&1 | tee "$RUNNER_TEMP/evidence/all-features.log"
+          cargo test --locked --all-targets -- --show-output 2>&1 | tee "$RUNNER_TEMP/evidence/production-tests.log"
+      - name: Production binary ignores every test control
+        run: |
+          cargo build --locked --release
+          python3 scripts/production_smoke.py target/release/git-thin --require-native > "$RUNNER_TEMP/evidence/production-smoke.json"
+      - name: Benchmark harness smoke, both layouts and methods
+        run: |
+          python3 scripts/benchmark_matrix.py "$TMPDIR" --output-dir "$RUNNER_TEMP/evidence" --git-thin "$(pwd)/target/release/git-thin" --build-features production --bytes 1048576 --edit-bytes 4096 --worktrees 2 --repetitions 1 --reserve-bytes 16777216 --run > "$RUNNER_TEMP/evidence/smoke-summary.json"
+      - name: Detach only the disposable test images
+        if: always()
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then
-            export GIT_THIN_REQUIRE_CLONE=1
-          fi
-          cargo test --locked --all-targets --all-features
-      - name: Release build
-        run: cargo build --locked --release
-      - name: Detach disposable APFS volumes
-        if: always() && runner.os == 'macOS'
+          for volume in native cross exhaustion; do
+            mountpoint="$RUNNER_TEMP/git-thin-$volume-volume"
+            if mount | grep -F " on $mountpoint (" > /dev/null; then hdiutil detach "$mountpoint"; fi
+          done
+      - name: Summarize executed and unavailable coverage
+        if: always()
+        run: python3 scripts/validation_summary.py "$RUNNER_TEMP/evidence" --lane "macOS / ${{ matrix.format }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-${{ matrix.format }}-evidence
+          path: ${{ runner.temp }}/evidence
+
+  linux-reflink:
+    name: Linux native / Btrfs loop filesystem
+    runs-on: ubuntu-latest
+    env:
+      GIT_THIN_REQUIRE_CLONE: '1'
+      GIT_THIN_REQUIRE_VOLUMES: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare disposable Btrfs images (requires runner mount privileges)
         shell: bash
         run: |
-          if [ -n "${GIT_THIN_CROSS_VOLUME_ROOT:-}" ]; then
-            hdiutil detach "$GIT_THIN_CROSS_VOLUME_ROOT"
-          fi
-          if [ -n "${GIT_THIN_EXHAUSTION_ROOT:-}" ]; then
-            hdiutil detach "$GIT_THIN_EXHAUSTION_ROOT"
-          fi
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          mkdir "$RUNNER_TEMP/evidence"
+          for volume in native cross exhaustion; do
+            size=256M
+            if [ "$volume" = native ]; then size=2G; fi
+            if [ "$volume" = exhaustion ]; then size=128M; fi
+            mountpoint="$RUNNER_TEMP/git-thin-$volume-volume"
+            mkdir "$mountpoint"
+            truncate -s "$size" "$RUNNER_TEMP/git-thin-$volume.img"
+            mkfs.btrfs -f "$RUNNER_TEMP/git-thin-$volume.img"
+            sudo mount -o loop "$RUNNER_TEMP/git-thin-$volume.img" "$mountpoint"
+            sudo chown "$(id -u):$(id -g)" "$mountpoint"
+          done
+          echo "TMPDIR=$RUNNER_TEMP/git-thin-native-volume" >> "$GITHUB_ENV"
+          echo "GIT_THIN_CROSS_VOLUME_ROOT=$RUNNER_TEMP/git-thin-cross-volume" >> "$GITHUB_ENV"
+          echo "GIT_THIN_EXHAUSTION_ROOT=$RUNNER_TEMP/git-thin-exhaustion-volume" >> "$GITHUB_ENV"
+      - name: Validate native lane capabilities
+        run: python3 scripts/validate_environment.py --filesystem btrfs --require-volumes | tee "$RUNNER_TEMP/evidence/environment.json"
+      - name: Required native tests as the unprivileged runner user
+        run: |
+          test "$(id -u)" != 0
+          cargo test --locked --all-targets --all-features -- --show-output 2>&1 | tee "$RUNNER_TEMP/evidence/all-features.log"
+          cargo test --locked --all-targets -- --show-output 2>&1 | tee "$RUNNER_TEMP/evidence/production-tests.log"
+      - name: Production controls and small scale probe
+        run: |
+          cargo build --locked --release
+          python3 scripts/production_smoke.py target/release/git-thin --require-native > "$RUNNER_TEMP/evidence/production-smoke.json"
+          python3 scripts/benchmark_matrix.py "$TMPDIR" --output-dir "$RUNNER_TEMP/evidence" --git-thin "$(pwd)/target/release/git-thin" --build-features production --bytes 1048576 --small-file-bytes 1024 --edit-bytes 4096 --worktrees 2 --repetitions 1 --reserve-bytes 16777216 --run > "$RUNNER_TEMP/evidence/smoke-summary.json"
+      - name: Unmount only the disposable test images
+        if: always()
+        shell: bash
+        run: |
+          for volume in native cross exhaustion; do
+            mountpoint="$RUNNER_TEMP/git-thin-$volume-volume"
+            if mountpoint -q "$mountpoint"; then sudo umount "$mountpoint"; fi
+          done
+      - name: Summarize executed and unavailable coverage
+        if: always()
+        run: python3 scripts/validation_summary.py "$RUNNER_TEMP/evidence" --lane "Linux Btrfs" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-btrfs-evidence
+          path: ${{ runner.temp }}/evidence

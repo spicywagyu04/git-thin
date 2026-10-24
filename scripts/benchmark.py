@@ -12,7 +12,10 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+
+_TIME_PROBE = None
 
 
 def run(args, cwd=None, env=None):
@@ -24,6 +27,55 @@ def run(args, cwd=None, env=None):
             + result.stdout.decode("utf-8", errors="replace")
         )
     return result.stdout
+
+
+def measured_run(args, cwd, env, report_directory):
+    """Use the platform's wait4-based time tool; do not infer RSS from allocation."""
+    time_binary = Path("/usr/bin/time")
+    memory = {
+        "peak_rss_bytes": None,
+        "method": "unavailable",
+        "limitation": "maximum RSS reported by time, not summed simultaneous process-tree memory",
+    }
+    global _TIME_PROBE
+    with tempfile.TemporaryDirectory(prefix="git-thin-measure-", dir=report_directory) as temporary:
+        statistics = Path(temporary) / "time.txt"
+        command = list(args)
+        if time_binary.exists() and sys.platform in ("darwin", "linux"):
+            prefix = [str(time_binary), "-l" if sys.platform == "darwin" else "-v", "-o", str(statistics)]
+            if _TIME_PROBE is None:
+                # A sandbox may permit the measured command but deny time's
+                # sysctl queries afterwards. Probe with a harmless command first;
+                # never retry a creation operation that may already have run.
+                probe = subprocess.run([*prefix, "/usr/bin/true"], cwd=cwd, env=env, capture_output=True, check=False)
+                _TIME_PROBE = (probe.returncode == 0, probe.stderr.decode("utf-8", errors="replace"))
+                if statistics.exists():
+                    statistics.unlink()
+            if _TIME_PROBE[0]:
+                command = [*prefix, *args]
+            else:
+                memory["warning"] = "time capability probe failed: " + _TIME_PROBE[1]
+        started = time.perf_counter()
+        output = run(command, cwd, env)
+        elapsed = time.perf_counter() - started
+        if statistics.exists():
+            memory["raw"] = statistics.read_text(encoding="utf-8")
+            memory["method"] = "/usr/bin/time -l" if sys.platform == "darwin" else "/usr/bin/time -v"
+            for line in memory["raw"].splitlines():
+                if sys.platform == "darwin" and "maximum resident set size" in line:
+                    memory["peak_rss_bytes"] = int(line.split()[0])
+                elif sys.platform == "linux" and "Maximum resident set size (kbytes):" in line:
+                    memory["peak_rss_bytes"] = int(line.rsplit(":", 1)[1].strip()) * 1024
+            if memory["peak_rss_bytes"] is None:
+                memory["warning"] = "time output did not contain a recognized peak RSS counter"
+    return output, elapsed, memory
+
+
+def optional_command(args, env):
+    try:
+        return run(args, env=env).decode("utf-8", errors="replace").strip()
+    except (OSError, RuntimeError) as error:
+        return {"unavailable": str(error)}
 
 
 def sync_and_measure(path):
@@ -145,11 +197,16 @@ def parse_args():
     parser.add_argument("--edit-bytes", type=int, default=16 * 1024 * 1024, help="in-place writes per worktree")
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--git-thin", default="git-thin", help="binary path or executable in PATH")
+    parser.add_argument("--build-features", default="unspecified", help="record exact features used to build the measured binary")
+    parser.add_argument("--environment-notes", type=Path, help="JSON object recording hardware, filesystem settings, snapshots, encryption, cache and background activity")
+    parser.add_argument("--reserve-bytes", type=int, default=1024 * 1024 * 1024, help="additional free filesystem reserve beyond fixture estimates")
     parser.add_argument("--run", action="store_true", help="required acknowledgement that fixtures consume disk")
     args = parser.parse_args()
     for field in ("bytes", "small_file_bytes", "worktrees", "edit_bytes"):
         if getattr(args, field) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
+    if args.reserve_bytes < 0:
+        parser.error("--reserve-bytes must be nonnegative")
     if not args.run:
         parser.error("pass --run to create the benchmark fixture; read docs/benchmarks.md first")
     return args
@@ -175,21 +232,25 @@ def main():
     if binary is not None:
         binary = os.path.abspath(binary)
     # Reserve room for the source, its Git blobs, changes and ordinary checkout controls.
-    reserve = args.bytes * (3 + (args.worktrees if args.method == "checkout" else 0))
+    reserve = args.bytes * (3 + (args.worktrees if args.method == "checkout" else 0)) + args.reserve_bytes
     if shutil.disk_usage(root.parent).free < reserve:
         raise RuntimeError(f"Need at least {reserve:,} free bytes in the benchmark parent.")
     env = os.environ.copy()
     for key in list(env):
         if key.startswith("GIT_"):
             del env[key]
-    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"})
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "running",
         "parameters": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "platform": platform.platform(),
         "python": platform.python_version(),
+        "hardware": {"machine": platform.machine(), "processor": platform.processor(), "logical_cpus": os.cpu_count()},
         "git": run(["git", "--version"], env=env).decode().strip(),
+        "rust": optional_command(["rustc", "--version"], env),
+        "tool_commit": optional_command(["git", "-C", str(Path(__file__).resolve().parent.parent), "rev-parse", "HEAD"], env),
+        "tool_checkout_status": optional_command(["git", "-C", str(Path(__file__).resolve().parent.parent), "status", "--porcelain"], env),
         "worktrees": [],
         "measurements": [],
         "limitations": [
@@ -198,8 +259,15 @@ def main():
             "Warm caches and a synthetic fixture affect elapsed times; record cold/warm conditions separately.",
         ],
     }
+    if args.environment_notes:
+        report["environment_notes"] = json.loads(args.environment_notes.read_text(encoding="utf-8"))
+        if not isinstance(report["environment_notes"], dict):
+            raise RuntimeError("--environment-notes must contain a JSON object")
+    else:
+        report["limitations"].append("Operator environment notes were not supplied; snapshot, cache, encryption and background-activity conditions are unverified.")
     if binary:
         report["git_thin"] = run([binary, "--version"], env=env).decode().strip()
+        report["binary"] = {"path": binary, "sha256": hashlib.sha256(Path(binary).read_bytes()).hexdigest(), "features": args.build_features}
     root.mkdir()  # Exclusive creation; the harness never deletes data, even on failure.
     try:
         report["measurements"].append({"phase": "before_source", **sync_and_measure(root)})
@@ -244,18 +312,17 @@ def main():
         for number in range(1, args.worktrees + 1):
             destination = root / f"worktree-{number}"
             branch = f"benchmark/{number}"
-            started = time.perf_counter()
             if args.method == "thin":
-                raw = run([binary, "--json", "add", str(destination), "--branch", branch, "--write", "fixture"], source, env)
+                raw, creation_seconds, creation_memory = measured_run([binary, "--json", "add", str(destination), "--branch", branch, "--write", "fixture"], source, env, output.parent)
                 creation = json.loads(raw)
             else:
-                raw = run(["git", "worktree", "add", "-b", branch, str(destination), report["creation_commit"]], source, env)
+                raw, creation_seconds, creation_memory = measured_run(["git", "worktree", "add", "-b", branch, str(destination), report["creation_commit"]], source, env, output.parent)
                 creation = {"git_output": raw.decode("utf-8", errors="replace")}
-            creation_seconds = time.perf_counter() - started
             verification_seconds = verify_contents(destination, entries, object_format)
             report["worktrees"].append({
                 "path": str(destination),
                 "creation_wall_seconds": creation_seconds,
+                "creation_memory": creation_memory,
                 "independent_full_content_verification_seconds": verification_seconds,
                 "logical_file_bytes": args.bytes,
                 "creation_result": creation,
@@ -275,9 +342,10 @@ def main():
             worktree["actual_edit_bytes"] = edit_fixture(destination, entries, args.edit_bytes, args.seed + number)
             report["measurements"].append({"phase": f"edited_{number}", **sync_and_measure(root)})
             if args.method == "thin":
-                started = time.perf_counter()
-                worktree["scope_check"] = json.loads(run([binary, "--json", "check", str(destination)], source, env))
-                worktree["scope_check_wall_seconds"] = time.perf_counter() - started
+                raw, elapsed, memory = measured_run([binary, "--json", "check", str(destination)], source, env, output.parent)
+                worktree["scope_check"] = json.loads(raw)
+                worktree["scope_check_wall_seconds"] = elapsed
+                worktree["scope_check_memory"] = memory
         report["source_independence_verification_seconds"] = verify_contents(source, entries, object_format)
         report["status"] = "complete"
     except BaseException as error:
