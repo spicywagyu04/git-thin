@@ -254,6 +254,27 @@ pub fn validate_source(repo: &Repo) -> Result<(String, Vec<Entry>), String> {
                 .into(),
         );
     }
+    // Status also inspects new index entries, including intent-to-add paths.
+    // Validate their attributes before it can run a clean filter. Reuse the
+    // NUL-delimited flags listing so clean preflight needs no extra Git call.
+    let mut attribute_paths = std::collections::BTreeSet::new();
+    for entry in &entries {
+        attribute_paths.insert(entry.path.as_os_str().as_encoded_bytes());
+    }
+    for record in flags
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.len() <= 2 || record[1] != b' ' {
+            return Err("invalid ls-files output while validating checkout attributes".into());
+        }
+        attribute_paths.insert(&record[2..]);
+    }
+    let mut input = Vec::new();
+    for path in attribute_paths {
+        input.extend_from_slice(path);
+        input.push(0);
+    }
     let mut child = command(root)
         .args([
             "check-attr",
@@ -269,11 +290,6 @@ pub fn validate_source(repo: &Repo) -> Result<(String, Vec<Entry>), String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
-    let mut input = Vec::new();
-    for entry in &entries {
-        input.extend_from_slice(entry.path.to_str().ok_or("non-UTF-8 path")?.as_bytes());
-        input.push(0);
-    }
     // Concurrent stdin writer avoids pipe deadlocks on large trees.
     let mut stdin = child.stdin.take().ok_or("Git stdin unavailable")?;
     let writer = std::thread::spawn(move || stdin.write_all(&input));

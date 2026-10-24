@@ -157,6 +157,76 @@ fn reject_source(fixture: &Fixture, expected: &str) {
 }
 
 #[test]
+fn source_index_additions_reject_filters_before_status_can_execute_them() {
+    for name in ["new", "-new\t雪\nfile"] {
+        for intent_only in [false, true] {
+            let fixture = Fixture::new();
+            fs::write(fixture.source.join(name), b"staged value\n").unwrap();
+            let mut args = vec!["add"];
+            if intent_only {
+                args.push("--intent-to-add");
+            }
+            args.extend(["--", name]);
+            git(&fixture.source, &args);
+            // Equal lengths require Git to hash the modified working contents
+            // instead of declaring a size mismatch without running the filter.
+            fs::write(fixture.source.join(name), b"edited value\n").unwrap();
+            let attributes = fixture.source.join(".git/info/attributes");
+            let rules = format!("{} filter=sentinel\n", json!(name));
+            fs::write(&attributes, &rules).unwrap();
+            let marker = fixture.root.join("filter-ran");
+            let script = format!("touch '{}'; cat", marker.display());
+            git(
+                &fixture.source,
+                &["config", "filter.sentinel.clean", &script],
+            );
+            let before = GitSnapshot::read(&fixture.source);
+            let bytes = tree_snapshot(&fixture.source);
+            let registrations = git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]);
+            let journal = fs::read(&fixture.journal).unwrap();
+            let destination = fixture.root.join("rejected-filter");
+            for args in [
+                vec!["doctor", "--json"],
+                vec![
+                    "add",
+                    text(&destination),
+                    "--branch",
+                    "agent/filter",
+                    "--dry-run",
+                    "--json",
+                ],
+                vec![
+                    "add",
+                    text(&destination),
+                    "--branch",
+                    "agent/filter",
+                    "--json",
+                ],
+            ] {
+                let result = json_output(thin(&fixture.source, &args), 2);
+                assert!(!marker.exists(), "preflight executed a clean filter for {name:?}, intent_only={intent_only}: {result}");
+                assert!(
+                    result["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("unsupported checkout attribute filter"),
+                    "{result}"
+                );
+                assert_eq!(GitSnapshot::read(&fixture.source), before);
+                assert_eq!(tree_snapshot(&fixture.source), bytes);
+                assert_eq!(fs::read_to_string(&attributes).unwrap(), rules);
+                assert_eq!(fs::read(&fixture.journal).unwrap(), journal);
+                assert_eq!(
+                    git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]),
+                    registrations
+                );
+                assert!(!destination.exists());
+            }
+        }
+    }
+}
+
+#[test]
 fn real_merge_cherry_pick_revert_and_sequencer_conflicts_reject_source() {
     for operation in ["merge", "cherry-pick", "revert", "sequencer"] {
         let fixture = Fixture::new();
