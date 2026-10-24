@@ -12,6 +12,8 @@ fs2 = "0.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1collisiondetection = "0.3.4"
+sha2 = "0.10.9"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 
@@ -23,3 +25,5 @@ path = "src/main.rs"
 
 [features]
 fault-injection = []
+
+[workspace]

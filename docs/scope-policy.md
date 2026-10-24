@@ -36,6 +36,11 @@ The check preserves all changes and returns a nonzero status on violations or er
 
 Working files are hashed as raw bytes, so index flags, cached timestamps, and line-ending normalization cannot hide edits. Introduced checkout filters and unsupported transformations cause an actionable error; checks do not execute those filters. Reading the tracked contents takes time proportional to the data being inspected.
 
+Intent-to-add entries (`git add -N`) count as index additions, including empty
+files. They remain changes if the working file disappears, until the index entry
+is removed with `git reset -- PATH`. This follows the same three-snapshot rule:
+restoring or deleting only a working file does not erase its index state.
+
 A final-state check cannot prove that a file was never temporarily modified and restored. A change completely restored to the baseline in all three snapshots is not a final-state violation. Restoring only the working file does not hide a violation still present in a commit or staged version. Likewise, a reverted commit no longer contributes a violation once `HEAD`, index, and working files all match the baseline. Run the check before handing work back, and review the ordinary Git diff as well.
 
 ## Generated outputs

@@ -152,18 +152,13 @@ fn assert_check(cwd: &Path, worktree: &Path, exit: i32, paths: &[&str]) {
     assert_eq!(output.status.code(), Some(exit), "{}", describe(&output));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("invalid JSON: {error}; {}", describe(&output)));
-    fn contains(value: &serde_json::Value, expected: &str) -> bool {
-        match value {
-            serde_json::Value::String(actual) => actual == expected,
-            serde_json::Value::Array(items) => items.iter().any(|item| contains(item, expected)),
-            serde_json::Value::Object(items) => items.values().any(|item| contains(item, expected)),
-            _ => false,
-        }
-    }
+    let violations = value["violations"].as_array().expect("violations array");
     for expected in paths {
         assert!(
-            contains(&value, expected),
-            "{expected:?} missing from {value}"
+            violations
+                .iter()
+                .any(|item| item.as_str() == Some(expected)),
+            "{expected:?} missing from violations: {value}"
         );
     }
 }
@@ -901,5 +896,348 @@ fn unsupported_source_filters_are_rejected_without_execution() {
     assert!(
         !marker.exists(),
         "preflight executed an unsupported clean filter"
+    );
+}
+
+#[test]
+fn three_native_siblings_remain_independent_across_realistic_save_patterns() {
+    let repo = Repo::new();
+    if !repo.can_clone() {
+        return;
+    }
+    symlink("main.txt", repo.source.join("src/link")).unwrap();
+    git(&repo.source, &["add", "."]);
+    git(&repo.source, &["commit", "-m", "link"]);
+    let baseline = git(&repo.source, &["rev-parse", "HEAD"]).stdout;
+    let source_index = fs::read(repo.source.join(".git/index")).unwrap();
+    let source_mode = fs::metadata(repo.source.join("src/main.txt"))
+        .unwrap()
+        .mode();
+    let mut siblings = Vec::new();
+    for i in 0..3 {
+        let p = repo.parent.join(format!("sibling-{i}"));
+        success(thin(
+            &repo.source,
+            &[
+                "add",
+                path(&p),
+                "--branch",
+                &format!("sibling-{i}"),
+                "--write",
+                ".",
+            ],
+        ));
+        siblings.push(p);
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    for root in std::iter::once(&repo.source).chain(&siblings) {
+        assert!(identities.insert(fs::metadata(root.join("src/main.txt")).unwrap().ino()));
+    }
+    let original = b"original source\n";
+    for pattern in [
+        "write", "atomic", "truncate", "recreate", "rename", "chmod", "link",
+    ] {
+        let root = &siblings[0];
+        let file = root.join("src/main.txt");
+        match pattern {
+            "write" => fs::write(&file, b"changed\n").unwrap(),
+            "atomic" => {
+                fs::write(root.join("src/save.tmp"), b"atomic\n").unwrap();
+                fs::rename(root.join("src/save.tmp"), &file).unwrap();
+            }
+            "truncate" => fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_len(0)
+                .unwrap(),
+            "recreate" => {
+                fs::remove_file(&file).unwrap();
+                fs::write(&file, b"recreated\n").unwrap();
+            }
+            "rename" => fs::rename(&file, root.join("src/moved")).unwrap(),
+            "chmod" => fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap(),
+            "link" => {
+                fs::remove_file(root.join("src/link")).unwrap();
+                symlink("../README.md", root.join("src/link")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        for untouched in [&repo.source, &siblings[1], &siblings[2]] {
+            assert_eq!(
+                fs::read(untouched.join("src/main.txt")).unwrap(),
+                original,
+                "{pattern}"
+            );
+            assert_eq!(
+                fs::read_link(untouched.join("src/link")).unwrap(),
+                Path::new("main.txt")
+            );
+            assert_eq!(git(untouched, &["rev-parse", "HEAD"]).stdout, baseline);
+            assert!(git(untouched, &["diff", "--cached", "--name-only"])
+                .stdout
+                .is_empty());
+        }
+        if pattern == "rename" {
+            fs::rename(root.join("src/moved"), &file).unwrap();
+        }
+        git(root, &["restore", "--worktree", "."]);
+    }
+    // The source itself can use an atomic save without changing any clone.
+    fs::write(repo.source.join("src/new-save"), b"source replacement\n").unwrap();
+    fs::rename(
+        repo.source.join("src/new-save"),
+        repo.source.join("src/main.txt"),
+    )
+    .unwrap();
+    for sibling in &siblings {
+        assert_eq!(fs::read(sibling.join("src/main.txt")).unwrap(), original);
+    }
+    assert_eq!(
+        fs::read(repo.source.join(".git/index")).unwrap(),
+        source_index
+    );
+    assert_eq!(
+        fs::metadata(repo.source.join("src/main.txt"))
+            .unwrap()
+            .mode(),
+        source_mode
+    );
+}
+
+#[test]
+fn source_configuration_and_operation_state_rejections_have_no_side_effects() {
+    for flag in ["--skip-worktree", "--assume-unchanged"] {
+        let repo = Repo::new();
+        git(&repo.source, &["update-index", flag, "README.md"]);
+        let index = fs::read(repo.source.join(".git/index")).unwrap();
+        repo.reject_add(&["skip-worktree", "assume-unchanged"]);
+        assert_eq!(fs::read(repo.source.join(".git/index")).unwrap(), index);
+    }
+    for value in ["true", "input"] {
+        let repo = Repo::new();
+        git(&repo.source, &["config", "core.autocrlf", value]);
+        repo.reject_add(&["autocrlf"]);
+    }
+    for state in [
+        "MERGE_HEAD",
+        "REBASE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "sequencer",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        let repo = Repo::new();
+        let marker = repo.source.join(".git").join(state);
+        fs::write(&marker, b"preserve operation evidence").unwrap();
+        repo.reject_add(&["operation in progress"]);
+        assert_eq!(fs::read(marker).unwrap(), b"preserve operation evidence");
+    }
+    for attr in [
+        "filter=lfs",
+        "working-tree-encoding=UTF-16",
+        "ident",
+        "eol=crlf",
+    ] {
+        let repo = Repo::new();
+        // info/attributes avoids executing the transformation to prepare a fixture.
+        fs::write(
+            repo.source.join(".git/info/attributes"),
+            format!("README.md {attr}\n"),
+        )
+        .unwrap();
+        repo.reject_add(&["unsupported checkout attribute"]);
+    }
+}
+
+#[test]
+fn hooks_fsmonitor_and_external_diff_are_suppressed_without_config_changes() {
+    let repo = Repo::new();
+    if !repo.can_clone() {
+        return;
+    }
+    let hook_dir = repo.parent.join("hooks");
+    fs::create_dir(&hook_dir).unwrap();
+    let marker = repo.parent.join("command-ran");
+    let script = format!("#!/bin/sh\nprintf ran >> '{}'\n", marker.display());
+    for name in [
+        "post-checkout",
+        "post-index-change",
+        "fsmonitor",
+        "external-diff",
+    ] {
+        let file = hook_dir.join(name);
+        fs::write(&file, &script).unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(&repo.source, &["config", "core.hooksPath", path(&hook_dir)]);
+    git(
+        &repo.source,
+        &[
+            "config",
+            "core.fsmonitor",
+            path(&hook_dir.join("fsmonitor")),
+        ],
+    );
+    git(
+        &repo.source,
+        &[
+            "config",
+            "diff.external",
+            path(&hook_dir.join("external-diff")),
+        ],
+    );
+    let config = fs::read(repo.source.join(".git/config")).unwrap();
+    let index = fs::read(repo.source.join(".git/index")).unwrap();
+    let global = repo.parent.join("global-config");
+    fs::write(
+        &global,
+        b"[user]\n\tname = Sentinel\n\temail = sentinel@example.invalid\n",
+    )
+    .unwrap();
+    let before_global = fs::read(&global).unwrap();
+    let destination = repo.parent.join("sentinel-worktree");
+    let run_thin = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_git-thin"))
+            .current_dir(&repo.source)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    };
+    success(run_thin(&["doctor", "--json"]));
+    success(run_thin(&[
+        "add",
+        path(&destination),
+        "--branch",
+        "sentinel",
+        "--write",
+        ".",
+        "--json",
+    ]));
+    fs::write(destination.join("README.md"), b"changed").unwrap();
+    success(run_thin(&["check", path(&destination), "--json"]));
+    assert!(
+        !marker.exists(),
+        "tool ran user hook, fsmonitor, or external diff"
+    );
+    assert_eq!(fs::read(repo.source.join(".git/config")).unwrap(), config);
+    assert_eq!(fs::read(repo.source.join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read(global).unwrap(), before_global);
+    for name in [
+        "post-checkout",
+        "post-index-change",
+        "fsmonitor",
+        "external-diff",
+    ] {
+        assert_eq!(fs::read(hook_dir.join(name)).unwrap(), script.as_bytes());
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+#[test]
+fn production_build_ignores_fault_controls() {
+    let repo = Repo::new();
+    if !repo.can_clone() {
+        return;
+    }
+    let ready = repo.parent.join("should-not-appear");
+    for (i, control) in [
+        "crash-after-registration",
+        "pause-before-clone",
+        "no-space",
+        "ready-metadata-persist",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let destination = repo.parent.join(format!("production-{i}"));
+        success(
+            Command::new(env!("CARGO_BIN_EXE_git-thin"))
+                .current_dir(&repo.source)
+                .args([
+                    "add",
+                    path(&destination),
+                    "--branch",
+                    &format!("production-{i}"),
+                    "--json",
+                ])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_THIN_TEST_FAILPOINT", control)
+                .env("GIT_THIN_TEST_READY_FILE", &ready)
+                .output()
+                .unwrap(),
+        );
+        assert!(destination.join("README.md").exists());
+    }
+    assert!(!ready.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apfs_case_rename_and_colliding_tree_paths_never_overwrite() {
+    let repo = Repo::new();
+    if !repo.can_clone() {
+        return;
+    }
+    fs::write(repo.source.join("case-file"), b"case baseline\n").unwrap();
+    fs::write(repo.source.join("caf\u{e9}"), b"unicode baseline\n").unwrap();
+    git(&repo.source, &["add", "."]);
+    git(&repo.source, &["commit", "-m", "case and unicode"]);
+    let insensitive = repo.source.join("CASE-FILE").exists();
+    let normalization_insensitive = repo.source.join("cafe\u{301}").exists();
+    eprintln!("APFS path capabilities: case_insensitive={insensitive}, normalization_insensitive={normalization_insensitive}");
+    let Some(worktree) = repo.add("src") else {
+        return;
+    };
+    git(&worktree, &["mv", "case-file", "intermediate"]);
+    git(&worktree, &["mv", "intermediate", "CASE-FILE"]);
+    assert_check(&repo.source, &worktree, 1, &["case-file", "CASE-FILE"]);
+    assert_eq!(
+        fs::read(repo.source.join("case-file")).unwrap(),
+        b"case baseline\n"
+    );
+    // Git can represent paths that this particular APFS volume aliases. Such a
+    // tree must fail safely or preserve both names on a volume that supports them.
+    let oid =
+        String::from_utf8(git(&repo.source, &["rev-parse", "HEAD:case-file"]).stdout).unwrap();
+    git(
+        &repo.source,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},CASE-FILE", oid.trim()),
+        ],
+    );
+    if !insensitive {
+        fs::write(repo.source.join("CASE-FILE"), b"case baseline\n").unwrap();
+    }
+    git(&repo.source, &["commit", "-m", "case-colliding tree"]);
+    let destination = repo.parent.join("colliding");
+    let result = thin(
+        &repo.source,
+        &["add", path(&destination), "--branch", "collision", "--json"],
+    );
+    if insensitive {
+        assert_eq!(result.status.code(), Some(2), "{}", describe(&result));
+        assert!(!destination.exists());
+    } else {
+        success(result);
+        assert_ne!(
+            fs::metadata(destination.join("case-file")).unwrap().ino(),
+            fs::metadata(destination.join("CASE-FILE")).unwrap().ino()
+        );
+    }
+    assert_eq!(
+        fs::read(repo.source.join("case-file")).unwrap(),
+        b"case baseline\n"
+    );
+    assert_eq!(
+        fs::read(repo.source.join("caf\u{e9}")).unwrap(),
+        b"unicode baseline\n"
     );
 }

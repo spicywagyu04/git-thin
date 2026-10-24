@@ -12,7 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub schema_version: u32,
@@ -50,12 +50,18 @@ impl Store {
         Ok(Self { dir, _lock: lock })
     }
     fn save(&self, metadata: &Metadata) -> Result<(), String> {
+        metadata_fault(metadata, "serialize")?;
+        let bytes = serde_json::to_vec_pretty(metadata).map_err(|e| e.to_string())?;
         let mut temp = tempfile::NamedTempFile::new_in(&self.dir).map_err(|e| e.to_string())?;
-        serde_json::to_writer_pretty(&mut temp, metadata).map_err(|e| e.to_string())?;
+        metadata_fault(metadata, "write")?;
+        temp.write_all(&bytes).map_err(|e| e.to_string())?;
         temp.write_all(b"\n").map_err(|e| e.to_string())?;
+        metadata_fault(metadata, "file-sync")?;
         temp.as_file().sync_all().map_err(|e| e.to_string())?;
+        metadata_fault(metadata, "persist")?;
         temp.persist(self.dir.join(format!("{}.json", metadata.id)))
             .map_err(|e| e.to_string())?;
+        metadata_fault(metadata, "directory-sync")?;
         git::sync_directory(&self.dir)
     }
     fn records(&self) -> Result<Vec<Metadata>, String> {
@@ -69,11 +75,24 @@ impl Store {
                 serde_json::from_reader(File::open(&path).map_err(|e| e.to_string())?).map_err(
                     |e| format!("invalid metadata {path:?}: {e}; preserve it for manual recovery"),
                 )?;
-            if meta.schema_version != SCHEMA
+            if ![1, SCHEMA].contains(&meta.schema_version)
                 || uuid::Uuid::parse_str(&meta.id).is_err()
                 || path.file_stem().and_then(|s| s.to_str()) != Some(&meta.id)
             {
                 return Err(format!("unsupported or invalid metadata {path:?}; upgrade git-thin or recover manually"));
+            }
+            // Read and validate every record before callers can mutate any one
+            // worktree. An unknown state must not permit partial recovery.
+            let known_state = matches!(
+                meta.state.as_str(),
+                "creating" | "publishing" | "ready" | "removing"
+            ) || (meta.schema_version == SCHEMA
+                && matches!(meta.state.as_str(), "indexing" | "verifying"));
+            if !known_state {
+                return Err(format!(
+                    "unknown operation state {:?} in {path:?}; preserve it for manual recovery",
+                    meta.state
+                ));
             }
             result.push(meta);
         }
@@ -81,8 +100,10 @@ impl Store {
         Ok(result)
     }
     fn delete(&self, metadata: &Metadata) -> Result<(), String> {
+        fault("before-journal-delete")?;
         fs::remove_file(self.dir.join(format!("{}.json", metadata.id)))
             .map_err(|e| e.to_string())?;
+        fault("after-journal-delete")?;
         git::sync_directory(&self.dir)
     }
     fn find(&self, path: &Path) -> Result<Metadata, String> {
@@ -116,20 +137,31 @@ fn absolute_target(path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(name))
 }
 
-fn exists(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok()
+fn inspect_path(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot inspect path {path:?}: {error}; preserve files and journal for manual recovery"
+        )),
+    }
 }
-fn owns(meta: &Metadata, path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .is_ok_and(|m| m.is_dir() && m.dev() == meta.device && m.ino() == meta.inode)
+fn exists(path: &Path) -> Result<bool, String> {
+    Ok(inspect_path(path)?.is_some())
+}
+fn owns(meta: &Metadata, path: &Path) -> Result<bool, String> {
+    Ok(inspect_path(path)?
+        .is_some_and(|m| m.is_dir() && m.dev() == meta.device && m.ino() == meta.inode))
 }
 fn assert_registered(repo: &Repo, meta: &Metadata, path: &Path) -> Result<(), String> {
-    if !owns(meta, path) {
+    if !owns(meta, path)? {
         return Err(format!(
             "worktree directory identity changed: {path:?}; refusing to modify it"
         ));
     }
-    let discovered = Repo::discover(path)?;
+    let discovered = Repo::discover(path).map_err(|e| {
+        format!("cannot validate worktree registration at {path:?}: {e}; preserve files and journal for manual recovery")
+    })?;
     if discovered.root != path || discovered.common != repo.common || !path.join(".git").is_file() {
         return Err(format!(
             "worktree registration does not match this repository: {path:?}"
@@ -163,7 +195,7 @@ pub fn add(
     dry_run: bool,
 ) -> Result<Value, String> {
     let destination = absolute_target(destination)?;
-    if exists(&destination) {
+    if exists(&destination)? {
         return Err(format!(
             "destination already exists: {destination:?}; choose a new path"
         ));
@@ -195,7 +227,7 @@ pub fn add(
     let store = Store::open(repo)?;
     // Recheck after acquiring the repository lock: another completed creation
     // may have consumed the requested branch while preflight was reading files.
-    if exists(&destination) {
+    if exists(&destination)? {
         return Err("destination appeared during preflight; choose a new path".into());
     }
     if git::run(&repo.root, ["show-ref", "--verify", &branch_ref]).is_ok() {
@@ -229,11 +261,20 @@ pub fn add(
         clone_ms: 0,
         verification_ms: 0,
     };
-    if let Err(e) = store.save(&meta) {
-        let _ = fs::remove_dir(&staging);
+    if let Err(e) = fault("after-reservation").and_then(|()| store.save(&meta)) {
+        if owns(&meta, &staging)? {
+            let _ = fs::remove_dir(&staging);
+        }
         return Err(e);
     }
     let result = (|| {
+        fault("after-first-journal")?;
+        if !owns(&meta, &staging)? {
+            return Err(
+                "staging directory identity changed before registration; refusing to modify it"
+                    .into(),
+            );
+        }
         git::run(
             &repo.root,
             [
@@ -251,7 +292,7 @@ pub fn add(
         fault("before-clone")?;
         fault("no-space")?;
         let start = Instant::now();
-        for entry in &entries {
+        for (position, entry) in entries.iter().enumerate() {
             match entry.mode.as_str() {
                 "120000" => backend::reproduce_symlink(&repo.root, &staging, &entry.path)?,
                 _ => backend::clone_regular(
@@ -261,9 +302,31 @@ pub fn add(
                     entry.mode == "100755",
                 )?,
             }
+            if position == 0 {
+                fault("after-partial-clone")?;
+            }
         }
         meta.clone_ms = start.elapsed().as_millis();
+        // A user-created index must not be overwritten by initialization.
+        validate_staging_index(&meta, &entries, false)?;
+        // Journal intent BEFORE touching the index. A crash in this transition
+        // is ambiguous and retained, never mistaken for a partial clone.
+        meta.state = "indexing".into();
+        store.save(&meta)?;
+        fault("before-index-initialization")?;
+        if staging_index_exists(&staging)? {
+            return Err("an index appeared before initialization; preserve staged work before manual recovery".into());
+        }
         git::run(&staging, ["read-tree", &commit])?;
+        let index = index_path(&staging)?;
+        File::open(&index)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        git::sync_directory(index.parent().ok_or("index has no parent")?)?;
+        fault("after-index-initialization")?;
+        meta.state = "verifying".into();
+        store.save(&meta)?;
+        fault("after-index-journal")?;
         fault("before-verification")?;
         let start = Instant::now();
         git::verify(&staging, &entries)?;
@@ -276,12 +339,15 @@ pub fn add(
             return Err("destination does not match the creation commit".into());
         }
         meta.verification_ms = start.elapsed().as_millis();
+        fault("after-verification")?;
         meta.state = "publishing".into();
         store.save(&meta)?;
-        if exists(&destination) {
+        fault("after-publishing-journal")?;
+        if exists(&destination)? {
             return Err("destination appeared during creation; leaving it untouched".into());
         }
         backend::rename_directory_noreplace(&staging, &destination)?;
+        fault("after-rename")?;
         git::run(
             &repo.root,
             [
@@ -291,13 +357,15 @@ pub fn add(
             ],
         )?;
         assert_registered(repo, &meta, &destination)?;
+        fault("after-repair")?;
         meta.state = "ready".into();
         store.save(&meta)?;
+        fault("after-ready-journal")?;
         Ok(json!({"worktree":meta,"clone_ms":meta.clone_ms,"verification_ms":meta.verification_ms}))
     })();
     if let Err(error) = result {
         // Never roll back a published directory: it may already be in use.
-        if owns(&meta, &destination) {
+        if owns(&meta, &destination)? {
             return Err(format!(
                 "{error}; destination was published; run git thin recover to finalize metadata"
             ));
@@ -341,30 +409,16 @@ fn validate_staging(repo: &Repo, meta: &Metadata, verify_bytes: bool) -> Result<
             }
         }
     }
+    // Even immediate rollback must preserve an index changed by another process.
+    // Only the bytes of freshly cloned files may skip verification on that path.
+    validate_staging_index(meta, &entries, verify_bytes)?;
     if verify_bytes {
-        // Before read-tree, the index may be absent/empty. Any entries that do
-        // exist must still be baseline entries, so staged user work is retained.
-        let index = git::run(&meta.staging_path, ["ls-files", "--stage", "-z"])?;
-        for record in index.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-            let tab = record
-                .iter()
-                .position(|b| *b == b'\t')
-                .ok_or("invalid staging index")?;
-            let path = std::str::from_utf8(&record[tab + 1..])
-                .map_err(|_| "non-UTF-8 staging index path")?;
-            let header =
-                std::str::from_utf8(&record[..tab]).map_err(|_| "invalid staging index header")?;
-            if !entries
-                .iter()
-                .any(|e| e.path == Path::new(path) && header == format!("{} {} 0", e.mode, e.oid))
-            {
-                return Err(format!("staged work differs from the creation commit at {path:?}; preserve it before recovery"));
+        let mut present = Vec::new();
+        for entry in entries {
+            if meta.state != "creating" || exists(&meta.staging_path.join(&entry.path))? {
+                present.push(entry);
             }
         }
-        let present: Vec<_> = entries
-            .into_iter()
-            .filter(|e| exists(&meta.staging_path.join(&e.path)))
-            .collect();
         git::verify(&meta.staging_path, &present).map_err(|e| {
             format!("staging contents changed; preserve local work before manual recovery: {e}")
         })?;
@@ -372,15 +426,96 @@ fn validate_staging(repo: &Repo, meta: &Metadata, verify_bytes: bool) -> Result<
     Ok(())
 }
 
-fn registered_branch_path(repo: &Repo, branch: &str) -> Result<Option<PathBuf>, String> {
+fn index_path(worktree: &Path) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(git::text(
+        worktree,
+        ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?))
+}
+
+fn staging_index_exists(worktree: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(index_path(worktree)?) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect staging index: {error}; preserve it for manual recovery"
+        )),
+    }
+}
+
+fn validate_staging_index(
+    meta: &Metadata,
+    entries: &[git::Entry],
+    recovering: bool,
+) -> Result<(), String> {
+    let index_exists = staging_index_exists(&meta.staging_path)?;
+    if meta.state == "creating" || (meta.state == "indexing" && !recovering && !index_exists) {
+        if index_exists {
+            return Err("an index appeared in a pre-index stage; preserve staged work before manual recovery".into());
+        }
+        return Ok(());
+    }
+    let index = git::run(&meta.staging_path, ["ls-files", "--stage", "-z"])?;
+    let mut remaining: std::collections::HashMap<_, _> = entries
+        .iter()
+        .map(|e| (e.path.clone(), format!("{} {} 0", e.mode, e.oid)))
+        .collect();
+    for record in index.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let tab = record
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("invalid staging index")?;
+        let path =
+            std::str::from_utf8(&record[tab + 1..]).map_err(|_| "non-UTF-8 staging index path")?;
+        let header =
+            std::str::from_utf8(&record[..tab]).map_err(|_| "invalid staging index header")?;
+        if remaining.remove(Path::new(path)).as_deref() != Some(header) {
+            return Err(format!("staged work differs from the creation commit at {path:?}; preserve it before recovery"));
+        }
+    }
+    if !remaining.is_empty() || !index_exists {
+        return Err("staged work differs from the creation commit (missing index entries or index); preserve staged deletions before recovery".into());
+    }
+    // An intent-to-add entry for a baseline empty file has the same mode/blob
+    // listing as the baseline, but still represents a staged deletion. Honor
+    // the index flag through Git's cached-diff semantics as well as membership.
+    if !git::run(
+        &meta.staging_path,
+        [
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ita-invisible-in-index",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &meta.creation_commit,
+            "--",
+        ],
+    )?
+    .is_empty()
+    {
+        return Err("staged work differs from the creation commit (including intent-to-add state); preserve it before recovery".into());
+    }
+    Ok(())
+}
+
+fn operation_registration(repo: &Repo, meta: &Metadata) -> Result<Option<PathBuf>, String> {
     let output = git::run(&repo.root, ["worktree", "list", "--porcelain", "-z"])?;
-    let branch = format!("branch refs/heads/{branch}");
+    let branch = format!("branch refs/heads/{}", meta.branch);
     let mut path = None;
     for field in output.split(|b| *b == 0) {
         if let Some(value) = field.strip_prefix(b"worktree ") {
-            path = Some(PathBuf::from(
+            let registered = PathBuf::from(
                 std::str::from_utf8(value).map_err(|_| "non-UTF-8 registered worktree path")?,
-            ));
+            );
+            // A user may move the directory and rename or detach its branch.
+            // Directory identity survives those operations; branch names do not.
+            if registered == meta.staging_path || owns(meta, &registered)? {
+                return Ok(Some(registered));
+            }
+            path = Some(registered);
         }
         if field == branch.as_bytes() {
             return Ok(path);
@@ -390,14 +525,19 @@ fn registered_branch_path(repo: &Repo, branch: &str) -> Result<Option<PathBuf>, 
 }
 
 fn validate_rollback(repo: &Repo, meta: &Metadata, verify_bytes: bool) -> Result<(), String> {
+    if verify_bytes
+        && ((meta.schema_version == 1 && meta.state == "creating") || meta.state == "indexing")
+    {
+        return Err("ambiguous index initialization in interrupted creation; preserve the directory, index, and journal for manual recovery".into());
+    }
     let path = &meta.staging_path;
-    if exists(path) {
-        if !owns(meta, path) {
+    if exists(path)? {
+        if !owns(meta, path)? {
             return Err(format!(
                 "staging identity changed; refusing cleanup: {path:?}"
             ));
         }
-        if exists(&path.join(".git")) {
+        if exists(&path.join(".git"))? {
             assert_registered(repo, meta, path)?;
             if git::text(path, ["rev-parse", "HEAD"])? != meta.creation_commit {
                 return Err("staging HEAD changed; preserve its work and recover manually".into());
@@ -413,8 +553,8 @@ fn validate_rollback(repo: &Repo, meta: &Metadata, verify_bytes: bool) -> Result
             );
         }
     }
-    if let Some(registered) = registered_branch_path(repo, &meta.branch)? {
-        if registered != *path || !exists(path) {
+    if let Some(registered) = operation_registration(repo, meta)? {
+        if registered != *path || !exists(path)? {
             return Err(format!("operation registration moved or is orphaned at {registered:?}; repair it before recovery"));
         }
     }
@@ -424,13 +564,13 @@ fn validate_rollback(repo: &Repo, meta: &Metadata, verify_bytes: bool) -> Result
 fn rollback(repo: &Repo, store: &Store, meta: &Metadata, verify_bytes: bool) -> Result<(), String> {
     validate_rollback(repo, meta, verify_bytes)?;
     let path = &meta.staging_path;
-    if exists(path) {
-        if !owns(meta, path) {
+    if exists(path)? {
+        if !owns(meta, path)? {
             return Err(format!(
                 "staging directory identity changed; refusing cleanup: {path:?}"
             ));
         }
-        if exists(&path.join(".git")) {
+        if exists(&path.join(".git"))? {
             assert_registered(repo, meta, path)?;
             let head = git::text(path, ["rev-parse", "HEAD"])?;
             if head != meta.creation_commit {
@@ -488,6 +628,15 @@ pub fn expand_scope(repo: &Repo, path: &Path, paths: &[String]) -> Result<Value,
     Ok(json!({"worktree":meta}))
 }
 fn ensure_removable(path: &Path) -> Result<(), String> {
+    let registrations = git::run(path, ["worktree", "list", "--porcelain", "-z"])?;
+    let mut selected = false;
+    for field in registrations.split(|byte| *byte == 0) {
+        if let Some(registered) = field.strip_prefix(b"worktree ") {
+            selected = registered == path.as_os_str().as_encoded_bytes();
+        } else if selected && (field == b"locked" || field.starts_with(b"locked ")) {
+            return Err("worktree is locked in Git; inspect its lock reason and explicitly unlock it before removal".into());
+        }
+    }
     let head = git::text(path, ["rev-parse", "HEAD"])?;
     let entries = git::tree(path, &head)?;
     scope::validate_checkout_configuration(path, &entries)?;
@@ -532,6 +681,7 @@ pub fn remove(repo: &Repo, path: &Path, dry_run: bool) -> Result<Value, String> 
     }
     meta.state = "removing".into();
     store.save(&meta)?;
+    fault("after-removing-journal")?;
     if let Err(e) = git::run(
         &repo.root,
         [
@@ -544,6 +694,7 @@ pub fn remove(repo: &Repo, path: &Path, dry_run: bool) -> Result<Value, String> 
         let _ = store.save(&meta);
         return Err(e);
     }
+    fault("after-git-removal")?;
     store.delete(&meta)?;
     Ok(json!({"removed":meta.path,"branch_preserved":meta.branch}))
 }
@@ -555,8 +706,8 @@ pub fn recover(repo: &Repo, dry_run: bool) -> Result<Value, String> {
             continue;
         }
         let action = match meta.state.as_str() {
-            "creating" | "publishing" => {
-                if owns(&meta, &meta.path) {
+            "creating" | "indexing" | "verifying" | "publishing" => {
+                if owns(&meta, &meta.path)? {
                     assert_registered(repo, &meta, &meta.path)?;
                     if git::text(&meta.path, ["rev-parse", "HEAD"])? != meta.creation_commit {
                         return Err(
@@ -586,7 +737,7 @@ pub fn recover(repo: &Repo, dry_run: bool) -> Result<Value, String> {
                 }
             }
             "removing" => {
-                if exists(&meta.path) {
+                if exists(&meta.path)? {
                     assert_registered(repo, &meta, &meta.path)?;
                     ensure_removable(&meta.path)?;
                     if !dry_run {
@@ -625,6 +776,11 @@ pub fn recover(repo: &Repo, dry_run: bool) -> Result<Value, String> {
     Ok(json!({"dry_run":dry_run,"recovered":actions}))
 }
 
+fn metadata_fault(metadata: &Metadata, point: &str) -> Result<(), String> {
+    fault(&format!("metadata-{point}"))?;
+    fault(&format!("{}-metadata-{point}", metadata.state))
+}
+
 #[cfg(not(feature = "fault-injection"))]
 fn fault(_: &str) -> Result<(), String> {
     Ok(())
@@ -641,10 +797,22 @@ fn fault(point: &str) -> Result<(), String> {
         fs::write(ready, b"ready").map_err(|e| e.to_string())?;
         let start = Instant::now();
         while !Path::new(&proceed).exists() {
-            if start.elapsed().as_secs() > 30 {
+            if start.elapsed().as_secs() > 60 {
                 return Err("test pause timed out".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    for (name, code) in [
+        ("ENOSPC", libc::ENOSPC),
+        ("EACCES", libc::EACCES),
+        ("EIO", libc::EIO),
+    ] {
+        if configured == format!("{name}-{point}") {
+            return Err(format!(
+                "injected {name} at {point}: {}",
+                std::io::Error::from_raw_os_error(code)
+            ));
         }
     }
     if configured == point {

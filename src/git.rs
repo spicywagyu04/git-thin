@@ -117,30 +117,65 @@ pub fn tree(root: &Path, commit: &str) -> Result<Vec<Entry>, String> {
     Ok(result)
 }
 
-pub(crate) fn hash_reader(root: &Path, reader: &mut dyn io::Read) -> Result<String, String> {
-    let mut child = command(root)
-        .args(["hash-object", "--no-filters", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let copied = io::copy(
-        reader,
-        &mut child.stdin.take().ok_or("Git stdin unavailable")?,
-    );
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    copied.map_err(|e| format!("content verification read failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Git content hash failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+/// Hash Git's blob header and raw contents in bounded memory. The expected
+/// object's length selects SHA-1 or SHA-256, so no process is needed per file.
+/// SHA-1 retains collision detection rather than silently weakening Git's check.
+pub(crate) fn hash_reader(
+    expected_oid: &str,
+    length: u64,
+    reader: &mut dyn io::Read,
+) -> Result<String, String> {
+    use sha2::Digest;
+    if !expected_oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid Git blob object ID".into());
     }
-    Ok(String::from_utf8(output.stdout)
-        .map_err(|e| e.to_string())?
-        .trim()
-        .into())
+    match expected_oid.len() {
+        40 => {
+            let mut hash = sha1collisiondetection::Sha1CD::default();
+            hash_contents(reader, length, |bytes| hash.update(bytes))?;
+            let digest = hash
+                .finalize_cd()
+                .map_err(|_| "SHA-1 collision detected while verifying blob")?;
+            Ok(format!("{digest:x}"))
+        }
+        64 => {
+            let mut hash = sha2::Sha256::new();
+            hash_contents(reader, length, |bytes| hash.update(bytes))?;
+            Ok(format!("{:x}", hash.finalize()))
+        }
+        _ => Err("unsupported Git blob object ID length".into()),
+    }
+}
+
+fn hash_contents(
+    reader: &mut dyn io::Read,
+    length: u64,
+    mut update: impl FnMut(&[u8]),
+) -> Result<(), String> {
+    update(format!("blob {length}\0").as_bytes());
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("content verification read failed: {error}")),
+        };
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or("file length overflow during verification")?;
+        if total > length {
+            return Err("file length changed during content verification".into());
+        }
+        update(&buffer[..count]);
+    }
+    if total != length {
+        return Err("file length changed during content verification".into());
+    }
+    Ok(())
 }
 
 /// Read actual bytes, independently of Git's index stat cache and assume-unchanged flags.
@@ -149,7 +184,11 @@ pub fn verify(root: &Path, entries: &[Entry]) -> Result<(), String> {
         let actual = if entry.mode == "120000" {
             let target = crate::backend::read_symlink(root, &entry.path)?;
             use std::os::unix::ffi::OsStrExt;
-            hash_reader(root, &mut target.as_os_str().as_bytes())?
+            hash_reader(
+                &entry.oid,
+                target.as_os_str().as_bytes().len() as u64,
+                &mut target.as_os_str().as_bytes(),
+            )?
         } else {
             let mut file = crate::backend::open_regular(root, &entry.path)?;
             let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -160,7 +199,7 @@ pub fn verify(root: &Path, entries: &[Entry]) -> Result<(), String> {
                     entry.path
                 ));
             }
-            hash_reader(root, &mut file)?
+            hash_reader(&entry.oid, meta.len(), &mut file)?
         };
         if actual != entry.oid {
             return Err(format!("content differs from the creation commit: {:?}; the source may have changed, or checkout transformations may be enabled",entry.path));
@@ -274,4 +313,45 @@ pub fn sync_directory(path: &Path) -> Result<(), String> {
     File::open(path)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("cannot sync directory {path:?}: {e}"))
+}
+
+#[cfg(test)]
+mod hashing_tests {
+    use super::*;
+    #[test]
+    fn streamed_blob_hashes_match_git_for_both_object_formats() {
+        for format in ["sha1", "sha256"] {
+            let dir = tempfile::tempdir().unwrap();
+            run(dir.path(), ["init", &format!("--object-format={format}")]).unwrap();
+            for size in [0, 1, 63, 64, 65, 65535, 65536, 65537, 2 * 1024 * 1024] {
+                let bytes: Vec<u8> = (0..size).map(|n| (n * 37) as u8).collect();
+                fs::write(dir.path().join("blob"), &bytes).unwrap();
+                let expected = text(dir.path(), ["hash-object", "--no-filters", "blob"]).unwrap();
+                assert_eq!(
+                    hash_reader(&expected, size as u64, &mut bytes.as_slice()).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn changing_lengths_and_read_errors_fail_without_a_digest() {
+        let oid = "0".repeat(40);
+        assert!(hash_reader(&oid, 4, &mut b"abc".as_slice())
+            .unwrap_err()
+            .contains("length changed"));
+        assert!(hash_reader(&oid, 2, &mut b"abc".as_slice())
+            .unwrap_err()
+            .contains("length changed"));
+        struct Broken;
+        impl io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+        assert!(hash_reader(&oid, 3, &mut Broken)
+            .unwrap_err()
+            .contains("read failed"));
+        assert!(hash_reader("invalid", 0, &mut b"".as_slice()).is_err());
+    }
 }

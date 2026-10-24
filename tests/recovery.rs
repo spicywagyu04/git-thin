@@ -74,6 +74,7 @@ impl Fixture {
         fs::write(source.join("src/main.txt"), "original\n").unwrap();
         fs::write(source.join("README.md"), "readme\n").unwrap();
         fs::write(source.join(".gitignore"), "build/\n").unwrap();
+        fs::write(source.join("empty"), b"").unwrap();
         git(&source, &["add", "."]);
         git(&source, &["commit", "-m", "baseline"]);
         let commit = git(&source, &["rev-parse", "HEAD"]);
@@ -93,7 +94,7 @@ impl Fixture {
         git(&source, &args);
         let identity = fs::symlink_metadata(&active_path).unwrap();
         let metadata = Metadata {
-            schema_version: 1,
+            schema_version: 2,
             id,
             creation_commit: commit,
             branch: "agent/fixture".into(),
@@ -102,7 +103,12 @@ impl Fixture {
                 path: ".".into(),
                 directory: true,
             }],
-            state: state.into(),
+            state: if state == "creating" && !no_checkout {
+                "verifying"
+            } else {
+                state
+            }
+            .into(),
             path: destination,
             staging_path,
             device: identity.dev(),
@@ -281,7 +287,7 @@ fn recovery_preserves_modified_tracked_file_in_interrupted_stage() {
         "post-crash edit\n"
     );
     assert!(fixture.metadata_file.exists());
-    assert_eq!(fixture.record().state, "creating");
+    assert_eq!(fixture.record().state, "verifying");
 }
 
 #[test]
@@ -357,4 +363,465 @@ fn missing_directory_with_orphan_registration_retains_recovery_journal() {
     success(fixture.thin(&["recover", "--json"]));
     assert!(!fixture.metadata_file.exists());
     fixture.assert_only_source_registered();
+}
+
+fn assert_staged_deletion_preserved(state: &str) {
+    let mut fixture = Fixture::new(state, false);
+    // Exercise the exact legacy journal states from the original data-loss bug.
+    fixture.metadata.schema_version = 1;
+    fixture.metadata.state = state.into();
+    fixture.save();
+    git(&fixture.active_path, &["rm", "--cached", "README.md"]);
+    let staged = git(&fixture.active_path, &["diff", "--cached", "--name-status"]);
+    assert!(staged.contains("D\tREADME.md"));
+    let preview = fixture.thin(&["recover", "--dry-run", "--json"]);
+    let result = fixture.thin(&["recover", "--json"]);
+    println!("{state} preview: {}", diagnostic(&preview));
+    println!("{state} recovery: {}", diagnostic(&result));
+    assert_eq!(
+        preview.status.code(),
+        Some(2),
+        "staged deletion must prevent cleanup preview"
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "staged deletion must prevent cleanup"
+    );
+    assert_eq!(
+        git(&fixture.active_path, &["diff", "--cached", "--name-status"]),
+        staged
+    );
+    assert_eq!(
+        fs::read(fixture.active_path.join("README.md")).unwrap(),
+        b"readme\n"
+    );
+    assert!(fixture.metadata_file.exists());
+    fixture.assert_branch_preserved(&fixture.metadata.creation_commit);
+}
+
+#[test]
+fn recovery_preserves_staged_deletion_creating() {
+    assert_staged_deletion_preserved("creating");
+}
+
+#[test]
+fn recovery_preserves_staged_deletion_publishing() {
+    assert_staged_deletion_preserved("publishing");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PreservedState {
+    contents: Vec<(PathBuf, Vec<u8>, u32, u64)>,
+    index: Option<Vec<u8>>,
+    head: String,
+    refs: String,
+    registrations: String,
+    journal: Vec<u8>,
+    identity: (u64, u64),
+}
+
+fn snapshot(fixture: &Fixture) -> PreservedState {
+    fn walk(root: &Path, relative: &Path, result: &mut Vec<(PathBuf, Vec<u8>, u32, u64)>) {
+        for entry in fs::read_dir(root.join(relative)).unwrap() {
+            let path = relative.join(entry.unwrap().file_name());
+            let metadata = fs::symlink_metadata(root.join(&path)).unwrap();
+            if metadata.is_dir() {
+                walk(root, &path, result);
+            } else {
+                let contents = if metadata.file_type().is_symlink() {
+                    fs::read_link(root.join(&path))
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec()
+                } else {
+                    fs::read(root.join(&path)).unwrap()
+                };
+                result.push((path, contents, metadata.mode(), metadata.ino()));
+            }
+        }
+    }
+    let mut contents = Vec::new();
+    walk(&fixture.active_path, Path::new(""), &mut contents);
+    contents.sort();
+    let identity = fs::symlink_metadata(&fixture.active_path).unwrap();
+    let index = git(
+        &fixture.active_path,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    );
+    PreservedState {
+        contents,
+        index: fs::read(index).ok(),
+        head: git(&fixture.active_path, &["rev-parse", "HEAD"]),
+        refs: git(&fixture.source, &["show-ref"]),
+        registrations: git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]),
+        journal: fs::read(&fixture.metadata_file).unwrap(),
+        identity: (identity.dev(), identity.ino()),
+    }
+}
+
+#[test]
+fn initialized_indexes_preserve_all_forms_of_staged_deletion_and_edits() {
+    for state in ["verifying", "publishing"] {
+        for edit in [
+            "cached-one",
+            "cached-all",
+            "empty",
+            "rm",
+            "rename",
+            "mixed",
+            "missing-index",
+            "unstaged-delete",
+            "intent-to-add-empty",
+        ] {
+            let fixture = Fixture::new(state, false);
+            match edit {
+                "cached-one" => {
+                    git(&fixture.active_path, &["rm", "--cached", "README.md"]);
+                }
+                "cached-all" => {
+                    git(&fixture.active_path, &["rm", "--cached", "-r", "."]);
+                }
+                "empty" => {
+                    git(&fixture.active_path, &["rm", "--cached", "empty"]);
+                }
+                "rm" => {
+                    git(&fixture.active_path, &["rm", "README.md"]);
+                }
+                "rename" => {
+                    git(&fixture.active_path, &["mv", "README.md", "renamed"]);
+                }
+                "mixed" => {
+                    git(&fixture.active_path, &["rm", "--cached", "README.md"]);
+                    fs::write(
+                        fixture.active_path.join("src/main.txt"),
+                        "valuable unstaged change\n",
+                    )
+                    .unwrap();
+                }
+                "missing-index" => {
+                    let index = git(
+                        &fixture.active_path,
+                        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+                    );
+                    fs::remove_file(index).unwrap();
+                }
+                "unstaged-delete" => {
+                    fs::remove_file(fixture.active_path.join("README.md")).unwrap();
+                }
+                "intent-to-add-empty" => {
+                    git(&fixture.active_path, &["rm", "--cached", "empty"]);
+                    git(&fixture.active_path, &["add", "-N", "empty"]);
+                    assert!(
+                        git(&fixture.active_path, &["diff", "--cached", "--name-status"])
+                            .contains("D\tempty")
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let before = snapshot(&fixture);
+            for args in [
+                ["recover", "--dry-run", "--json"].as_slice(),
+                ["recover", "--json"].as_slice(),
+                ["recover", "--json"].as_slice(),
+            ] {
+                let output = fixture.thin(args);
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{state}/{edit}: {}",
+                    diagnostic(&output)
+                );
+                assert_eq!(snapshot(&fixture), before, "{state}/{edit}");
+            }
+        }
+    }
+}
+
+#[test]
+fn ambiguous_legacy_creating_and_index_transition_records_are_preserved() {
+    for (schema, state, no_checkout) in [
+        (1, "creating", true),
+        (1, "creating", false),
+        (2, "indexing", true),
+        (2, "indexing", false),
+    ] {
+        let mut fixture = Fixture::new(state, no_checkout);
+        fixture.metadata.schema_version = schema;
+        fixture.metadata.state = state.into();
+        fixture.save();
+        let before = snapshot(&fixture);
+        for args in [
+            vec!["recover", "--dry-run"],
+            vec!["recover"],
+            vec!["recover"],
+        ] {
+            let result = fixture.thin(&args);
+            assert_eq!(result.status.code(), Some(2), "{}", diagnostic(&result));
+            assert!(diagnostic(&result).contains("ambiguous index initialization"));
+            assert_eq!(snapshot(&fixture), before);
+        }
+    }
+}
+
+#[test]
+fn schema_one_ready_worktrees_remain_usable_without_reinterpretation() {
+    let mut fixture = Fixture::new("ready", false);
+    fixture.metadata.schema_version = 1;
+    fixture.save();
+    success(fixture.thin(&["check", text(&fixture.active_path)]));
+    success(fixture.thin(&["status", text(&fixture.active_path)]));
+    success(fixture.thin(&["scope", "add", text(&fixture.active_path), "future/"]));
+    assert_eq!(fixture.record().schema_version, 1);
+    success(fixture.thin(&["remove", text(&fixture.active_path)]));
+    fixture.assert_branch_preserved(&fixture.metadata.creation_commit);
+}
+
+#[test]
+fn known_pre_index_partial_clone_can_recover_but_an_appeared_index_cannot() {
+    let fixture = Fixture::new("creating", true);
+    fs::write(fixture.active_path.join("README.md"), b"readme\n").unwrap();
+    let before = snapshot(&fixture);
+    success(fixture.thin(&["recover", "--dry-run"]));
+    assert_eq!(snapshot(&fixture), before);
+    success(fixture.thin(&["recover"]));
+    assert!(!fixture.active_path.exists());
+    fixture.assert_branch_preserved(&fixture.metadata.creation_commit);
+
+    let fixture = Fixture::new("creating", true);
+    git(
+        &fixture.active_path,
+        &["read-tree", &fixture.metadata.creation_commit],
+    );
+    let before = snapshot(&fixture);
+    let result = fixture.thin(&["recover"]);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(diagnostic(&result).contains("index appeared"));
+    assert_eq!(snapshot(&fixture), before);
+}
+
+#[test]
+fn malformed_unknown_schema_and_unknown_state_block_all_records_before_cleanup() {
+    for kind in ["truncated", "schema", "state"] {
+        let fixture = Fixture::new("creating", true);
+        let before = snapshot(&fixture);
+        let mut bad = fixture.metadata.clone();
+        bad.id = uuid::Uuid::new_v4().to_string();
+        // Sort after the valid record, so validation must precede any action.
+        bad.path = fixture.metadata.path.parent().unwrap().join("zz-malformed");
+        match kind {
+            "schema" => bad.schema_version = 777,
+            "state" => bad.state = "unknown-future-state".into(),
+            _ => (),
+        }
+        let bad_path = fixture
+            .metadata_file
+            .parent()
+            .unwrap()
+            .join(format!("{}.json", bad.id));
+        let bytes = if kind == "truncated" {
+            b"{\"schema_version\":".to_vec()
+        } else {
+            serde_json::to_vec(&bad).unwrap()
+        };
+        fs::write(&bad_path, &bytes).unwrap();
+        for args in [
+            vec!["recover", "--dry-run"],
+            vec!["recover"],
+            vec!["recover"],
+        ] {
+            let result = fixture.thin(&args);
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "{kind}: {}",
+                diagnostic(&result)
+            );
+            assert!(
+                diagnostic(&result).contains("manual") || diagnostic(&result).contains("manually")
+            );
+            assert_eq!(snapshot(&fixture), before);
+            assert_eq!(fs::read(&bad_path).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn recovery_preserves_changes_added_after_removal_intent() {
+    let fixture = Fixture::new("removing", false);
+    git(&fixture.active_path, &["rm", "--cached", "README.md"]);
+    let before = snapshot(&fixture);
+    for args in [
+        vec!["recover", "--dry-run"],
+        vec!["recover"],
+        vec!["recover"],
+    ] {
+        assert_eq!(fixture.thin(&args).status.code(), Some(2));
+        assert_eq!(snapshot(&fixture), before);
+    }
+}
+
+#[test]
+fn replaced_and_moved_staging_directories_are_retained_with_their_journals() {
+    for replace in [false, true] {
+        let fixture = Fixture::new("creating", true);
+        let moved = fixture.active_path.with_file_name("retained-original");
+        git(
+            &fixture.source,
+            &["worktree", "move", text(&fixture.active_path), text(&moved)],
+        );
+        let registration = git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]);
+        let journal = fs::read(&fixture.metadata_file).unwrap();
+        let identity = fs::symlink_metadata(&moved).unwrap().ino();
+        if replace {
+            fs::create_dir(&fixture.active_path).unwrap();
+            fs::write(
+                fixture.active_path.join("unrelated"),
+                b"not owned by git-thin\n",
+            )
+            .unwrap();
+        }
+        for args in [
+            vec!["recover", "--dry-run"],
+            vec!["recover"],
+            vec!["recover"],
+        ] {
+            let output = fixture.thin(&args);
+            assert_eq!(output.status.code(), Some(2), "{}", diagnostic(&output));
+            assert!(diagnostic(&output).contains(if replace {
+                "identity changed"
+            } else {
+                "moved or is orphaned"
+            }));
+            assert_eq!(fs::read(&fixture.metadata_file).unwrap(), journal);
+            assert_eq!(fs::symlink_metadata(&moved).unwrap().ino(), identity);
+            assert_eq!(
+                git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]),
+                registration
+            );
+            if replace {
+                assert_eq!(
+                    fs::read(fixture.active_path.join("unrelated")).unwrap(),
+                    b"not owned by git-thin\n"
+                );
+            }
+            fixture.assert_branch_preserved(&fixture.metadata.creation_commit);
+        }
+    }
+}
+
+#[test]
+fn inaccessible_recorded_paths_never_become_missing_resources() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("UNAVAILABLE: inaccessible-parent recovery requires an unprivileged test user");
+        return;
+    }
+    for state in ["creating", "removing", "publishing"] {
+        let mut fixture = Fixture::new(state, state == "creating");
+        git(
+            &fixture.source,
+            &["worktree", "remove", "--force", text(&fixture.active_path)],
+        );
+        let parent = fixture.source.parent().unwrap().join("inaccessible-parent");
+        fs::create_dir(&parent).unwrap();
+        let recorded = parent.join("retained");
+        fs::create_dir(&recorded).unwrap();
+        fs::write(recorded.join("valuable"), b"keep this local work\n").unwrap();
+        let metadata = fs::metadata(&recorded).unwrap();
+        fixture.metadata.device = metadata.dev();
+        fixture.metadata.inode = metadata.ino();
+        if state == "creating" {
+            fixture.metadata.staging_path = recorded.clone();
+        } else {
+            fixture.metadata.path = recorded.clone();
+        }
+        fixture.save();
+        let journal = fs::read(&fixture.metadata_file).unwrap();
+        let refs = git(&fixture.source, &["show-ref"]);
+        let registrations = git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]);
+        let permissions = fs::metadata(&parent).unwrap().permissions();
+        for args in [
+            vec!["recover", "--dry-run"],
+            vec!["recover"],
+            vec!["recover"],
+        ] {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+            let result = fixture.thin(&args);
+            // Restore before assertions so panic cannot leave the fixture locked.
+            fs::set_permissions(&parent, permissions.clone()).unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "{state}: {}",
+                diagnostic(&result)
+            );
+            assert!(diagnostic(&result).contains("cannot inspect path"));
+            assert_eq!(fs::read(&fixture.metadata_file).unwrap(), journal);
+            assert_eq!(
+                fs::read(recorded.join("valuable")).unwrap(),
+                b"keep this local work\n"
+            );
+            assert_eq!(fs::metadata(&recorded).unwrap().ino(), metadata.ino());
+            assert_eq!(git(&fixture.source, &["show-ref"]), refs);
+            assert_eq!(
+                git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]),
+                registrations
+            );
+        }
+    }
+    eprintln!(
+        "EXECUTED real inaccessible-parent EACCES recovery as uid {}",
+        unsafe { libc::geteuid() }
+    );
+}
+
+#[test]
+fn moved_staging_registrations_survive_branch_renaming_and_detachment() {
+    for head_change in ["rename", "detach"] {
+        let fixture = Fixture::new("publishing", false);
+        let moved = fixture.active_path.with_file_name("moved-with-work");
+        git(
+            &fixture.source,
+            &["worktree", "move", text(&fixture.active_path), text(&moved)],
+        );
+        if head_change == "rename" {
+            git(&moved, &["branch", "-m", "agent/renamed"]);
+        } else {
+            git(&moved, &["checkout", "--detach"]);
+        }
+        let journal = fs::read(&fixture.metadata_file).unwrap();
+        let registrations = git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]);
+        let refs = git(&fixture.source, &["show-ref"]);
+        let index = git(
+            &moved,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        );
+        let index_bytes = fs::read(&index).unwrap();
+        let identity = fs::symlink_metadata(&moved).unwrap().ino();
+        for args in [
+            vec!["recover", "--dry-run"],
+            vec!["recover"],
+            vec!["recover"],
+        ] {
+            let result = fixture.thin(&args);
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "{head_change}: {}",
+                diagnostic(&result)
+            );
+            assert!(diagnostic(&result).contains("moved or is orphaned"));
+            assert_eq!(fs::read(&fixture.metadata_file).unwrap(), journal);
+            assert_eq!(fs::read(moved.join("README.md")).unwrap(), b"readme\n");
+            assert_eq!(fs::read(&index).unwrap(), index_bytes);
+            assert_eq!(fs::symlink_metadata(&moved).unwrap().ino(), identity);
+            assert_eq!(git(&fixture.source, &["show-ref"]), refs);
+            assert_eq!(
+                git(&fixture.source, &["worktree", "list", "--porcelain", "-z"]),
+                registrations
+            );
+        }
+    }
 }
