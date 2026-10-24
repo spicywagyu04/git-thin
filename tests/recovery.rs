@@ -778,6 +778,54 @@ fn inaccessible_recorded_paths_never_become_missing_resources() {
 }
 
 #[test]
+fn moved_removal_registrations_preserve_work_after_branch_changes() {
+    for head_change in ["unchanged", "rename", "detach"] {
+        let mut fixture = Fixture::new("removing", false);
+        let moved = fixture
+            .active_path
+            .with_file_name("moved-removal-with-work");
+        git(
+            &fixture.source,
+            &["worktree", "move", text(&fixture.active_path), text(&moved)],
+        );
+        // The journal retains the original destination; snapshots follow the
+        // actual directory so every retained resource can be compared.
+        fixture.active_path = moved;
+        match head_change {
+            "rename" => {
+                git(&fixture.active_path, &["branch", "-m", "agent/renamed"]);
+            }
+            "detach" => {
+                git(&fixture.active_path, &["checkout", "--detach"]);
+            }
+            _ => {}
+        }
+        fs::write(fixture.active_path.join("README.md"), b"staged work\n").unwrap();
+        git(&fixture.active_path, &["add", "README.md"]);
+        fs::write(fixture.active_path.join("README.md"), b"unstaged work\n").unwrap();
+        fs::write(fixture.active_path.join("untracked"), b"new work\n").unwrap();
+        fs::create_dir(fixture.active_path.join("build")).unwrap();
+        fs::write(fixture.active_path.join("build/output"), b"ignored work\n").unwrap();
+        let before = snapshot(&fixture);
+        for args in [
+            vec!["recover", "--dry-run"],
+            vec!["recover"],
+            vec!["recover"],
+        ] {
+            let result = fixture.thin(&args);
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "{head_change}: {}",
+                diagnostic(&result)
+            );
+            assert!(diagnostic(&result).contains("moved or is orphaned"));
+            assert_eq!(snapshot(&fixture), before, "{head_change}");
+        }
+    }
+}
+
+#[test]
 fn moved_staging_registrations_survive_branch_renaming_and_detachment() {
     for head_change in ["rename", "detach"] {
         let fixture = Fixture::new("publishing", false);

@@ -763,6 +763,9 @@ pub fn recover(repo: &Repo, dry_run: bool) -> Result<Value, String> {
                     {
                         return Err(format!("removed directory still has a Git registration at {:?}; inspect and remove that stale registration with Git before recovery", meta.path));
                     }
+                    if let Some(registered) = operation_registration(repo, &meta)? {
+                        return Err(format!("removal registration moved or is orphaned at {registered:?}; preserve its work and repair it before recovery"));
+                    }
                 }
                 if !dry_run {
                     store.delete(&meta)?;
