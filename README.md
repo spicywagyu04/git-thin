@@ -91,7 +91,7 @@ The current implementation targets Unix paths. Filenames containing spaces, Unic
 - This is a developer tool, not a sandbox or a security boundary. Filesystem permissions, Git hooks, and post-run checks do not provide strict isolation from a hostile process.
 - Do not run general Git worktree removal or relocation concurrently with a git-thin lifecycle operation. Its repository lock coordinates other git-thin processes.
 
-See [architecture and recovery](docs/architecture.md), [benchmarks](docs/benchmarks.md), and [contributing](CONTRIBUTING.md). Benchmark instructions are provided; no APFS savings result is claimed before it has been measured on real APFS hardware or a controlled APFS volume.
+See [architecture and recovery](docs/architecture.md), [functional readiness evidence](docs/readiness.md), [measured APFS results](docs/measurements.md), [benchmark procedure](docs/benchmarks.md), and [contributing](CONTRIBUTING.md). The measured trials show substantially lower additional allocation with slower creation; the results document the tested setup and limits.
 
 ## License
 

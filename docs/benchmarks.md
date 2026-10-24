@@ -1,9 +1,10 @@
 # Reproducible storage benchmarks
 
-No storage-saving or performance result has been published by this repository.
-The harness records observations from a real filesystem. An APFS run is required
-before making claims about macOS storage savings. A successful Linux run cannot
-substitute for that evidence.
+The [measured APFS results](measurements.md) record twelve controlled-volume
+trials, including the observed storage and creation-time tradeoff. The harness
+records observations from a real filesystem; these APFS measurements do not
+establish Linux performance or exact shared-extent accounting. Follow this
+procedure to repeat the experiment on another configuration.
 
 ## Prepare an isolated filesystem
 

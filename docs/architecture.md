@@ -4,7 +4,7 @@
 
 ## Creation
 
-Creation resolves the source `HEAD` to an immutable object ID before doing work. Preflight checks require a complete source checkout with no tracked staged or unstaged changes, no merge or rebase in progress, and no unsupported tree or checkout features. Untracked and ignored source files are not copied.
+Creation resolves the source `HEAD` to an immutable object ID before doing work. Preflight checks require a complete source checkout with no tracked staged or unstaged changes, no merge or rebase in progress, and no unsupported tree or checkout features. Attributes are checked for both committed and current-index paths before invoking Git status, so a newly staged or intent-to-add file cannot execute an unsupported clean filter during preflight. Untracked and ignored source files are not copied.
 
 The backend probes actual cloning support and checks that source and destination use the same filesystem. macOS uses APFS cloning through `clonefile`; Linux uses `FICLONE`. An unsupported operation fails without a copying fallback. No source file's permissions or contents are changed.
 
