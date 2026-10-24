@@ -399,18 +399,22 @@ pub fn check(root: &Path, baseline: &str, entries: &[ScopeEntry]) -> Result<Chec
         "compare committed changes with the creation commit",
     )?;
     add_paths(&mut changed, &head.stdout)?;
-    let index = run(
-        command(root)
-            .arg("diff")
-            .args(diff_options)
-            // An intent-to-add entry is an addition in the index snapshot,
-            // including an empty or subsequently removed working file. Git
-            // normally hides it from a cached diff; explicitly retain it.
-            // This option is supported by the minimum Git version (2.39).
-            .args(["--cached", "--ita-visible-in-index", baseline, "--"]),
-        "compare staged changes with the creation commit",
-    )?;
-    add_paths(&mut changed, &index.stdout)?;
+    // Both index views are needed: visible intent-to-add entries expose new
+    // additions, while invisible entries preserve staged deletions of baseline
+    // files whose empty blobs would otherwise match the intent-to-add entries.
+    // Both options are supported by the minimum Git version (2.39).
+    for intent_view in ["--ita-visible-in-index", "--ita-invisible-in-index"] {
+        let index = run(
+            command(root).arg("diff").args(diff_options).args([
+                "--cached",
+                intent_view,
+                baseline,
+                "--",
+            ]),
+            "compare staged changes with the creation commit",
+        )?;
+        add_paths(&mut changed, &index.stdout)?;
+    }
 
     working_changes(root, &baseline_entries, &mut changed)?;
 
@@ -646,6 +650,74 @@ mod tests {
                 .violations,
             ["new-staged", "outside"]
         );
+    }
+
+    #[test]
+    fn empty_baseline_intent_to_add_cannot_hide_staged_deletions() {
+        let (dir, _) = repository();
+        let names = ["allowed/empty", "outside-empty", "-empty\t雪\nfile"];
+        for name in names {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        git(
+            dir.path(),
+            &[
+                "add",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        git(dir.path(), &["commit", "-qm", "empty baseline files"]);
+        let baseline = git(dir.path(), &["rev-parse", "HEAD"]);
+        git(
+            dir.path(),
+            &[
+                "rm",
+                "--cached",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        git(
+            dir.path(),
+            &[
+                "add",
+                "--intent-to-add",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        let before = fs::read(dir.path().join(".git/index")).unwrap();
+        let result = check(dir.path(), &baseline, &allowed(dir.path())).unwrap();
+        assert_eq!(result.violations, ["-empty\t雪\nfile", "outside-empty"]);
+        assert_eq!(
+            result.changed_paths,
+            ["-empty\t雪\nfile", "allowed/empty", "outside-empty"]
+        );
+        assert_eq!(fs::read(dir.path().join(".git/index")).unwrap(), before);
+        assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), baseline);
+        for name in names {
+            assert!(fs::read(dir.path().join(name)).unwrap().is_empty());
+        }
+        git(
+            dir.path(),
+            &[
+                "add",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        let restored = check(dir.path(), &baseline, &allowed(dir.path())).unwrap();
+        assert!(restored.clean);
+        assert!(restored.changed_paths.is_empty());
     }
 
     #[test]
@@ -926,7 +998,7 @@ mod tests {
         if let Err(error) = fs::write(dir.path().join(OsStr::from_bytes(b"nonutf8-\xff")), "new") {
             if error.raw_os_error() == Some(libc::EILSEQ) {
                 eprintln!(
-                    "SKIP non-UTF-8 scope test: filesystem rejects non-UTF-8 filenames: {error}"
+                    "INAPPLICABLE non-UTF-8 scope test: filesystem rejects non-UTF-8 filenames: {error}"
                 );
                 return;
             }

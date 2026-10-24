@@ -8,6 +8,23 @@ from pathlib import Path
 import re
 
 
+def scenario_messages(text):
+    unavailable = set()
+    inapplicable = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if re.search(r"\bINAPPLICABLE\b", line):
+            inapplicable.add(line)
+        elif re.search(r"\b(SKIP|UNAVAILABLE)\b", line):
+            # Older APFS tests used SKIP for a filesystem-impossible filename.
+            # Preserve that evidence's meaning while accepting explicit markers.
+            if "filesystem rejects non-UTF-8 filenames" in line:
+                inapplicable.add(line)
+            else:
+                unavailable.add(line)
+    return unavailable, inapplicable
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", type=Path)
@@ -22,6 +39,7 @@ def main():
     else:
         print("- Capability report missing: environment validation did not complete.")
     unavailable = set()
+    inapplicable = set()
     for name in ("all-features.log", "production-tests.log"):
         path = args.evidence / name
         if not path.exists():
@@ -34,7 +52,9 @@ def main():
             print(f"- `{summary}`")
         if not summaries:
             print("- No completed Rust test results found.")
-        unavailable.update(line.strip() for line in text.splitlines() if re.search(r"\b(SKIP|UNAVAILABLE)\b", line))
+        missing, excluded = scenario_messages(text)
+        unavailable.update(missing)
+        inapplicable.update(excluded)
     print("\n### Unavailable scenarios\n")
     if unavailable:
         print("Rust may count early-returning tests as passed; these scenarios did not execute.\n")
@@ -42,6 +62,13 @@ def main():
             print(f"- {line}")
     else:
         print("No unavailable messages in the retained logs. Inspect missing-suite notes above before inferring coverage.")
+    print("\n### Inapplicable scenarios\n")
+    if inapplicable:
+        print("These assertions do not apply to this filesystem or configuration; they are not executed passes.\n")
+        for line in sorted(inapplicable):
+            print(f"- {line}")
+    else:
+        print("No inapplicable messages in the retained logs.")
     for name in ("production-smoke.json", "smoke-summary.json"):
         path = args.evidence / name
         print(f"\n### {name}\n")

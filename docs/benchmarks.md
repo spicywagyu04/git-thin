@@ -96,11 +96,13 @@ The JSON includes:
 | `creation_wall_seconds` | Complete `add` or ordinary Git checkout elapsed time |
 | `creation_result` | Unmodified structured git-thin output, including phase timings when provided |
 | `clone_ms`, `verification_ms` | git-thin's own clone and creation-verification phase durations |
-| `independent_full_content_verification_seconds` | Separate full read/hash of the completed worktree |
+| `independent_full_content_verification_seconds` | Separate full read/hash immediately after creating each worktree |
+| `pre_edit_independence_verification_seconds` | Additional full read/hash immediately before editing each worktree, proving earlier edits did not leak into it |
 | `scope_check_wall_seconds` | Final-state scope check after edits; distinct from creation verification |
 | `measurements` | Synchronized allocation-counter snapshots before source creation, after commit, after each worktree, and after edits |
 | `actual_edit_bytes` | Number of bytes written by the controlled editing pass |
 | `source_independence_verification_seconds` | Full hash verification that source content remained unchanged |
+| `total_independent_verification_seconds` | Sum of the post-creation and pre-edit passes for every worktree, plus the final source pass; excludes the tool's internal verification and scope checking |
 | `creation_memory`, `scope_check_memory` | Per-command peak resident bytes from macOS `time -l` or Linux `time -v`, with raw output and unavailable counters explicitly identified |
 | `binary`, `tool_commit`, `tool_checkout_status` | Exact binary SHA-256, declared build features, source commit, and uncommitted changes; a commit alone cannot identify a dirty candidate |
 | `environment_notes` | Operator-supplied hardware, filesystem, snapshot, encryption/compression, cache and background-activity notes |
@@ -108,11 +110,19 @@ The JSON includes:
 Creation time includes git-thin's own mandatory content verification. The
 independent verification measurement is an additional pass; do not subtract it
 from creation time or call the scope check a full creation verification.
+The pre-edit pass is also timed and reported separately. The total independent
+verification field accounts for all harness verification passes without adding
+them to creation wall time. Older reports lack the pre-edit duration; their total
+cannot be reconstructed and remains unavailable in matrix summaries.
 Memory is the high-water RSS returned by the platform's `time` command, not a
 sum of simultaneous parent/child resident memory. It excludes the Python
 harness's independent verification pass. Measurement files live beside the
 report, outside the benchmark fixture. Missing memory counters are unavailable,
 not zero. Reports use schema version 2; earlier reports lack these counters.
+The matrix reports a trial's peak RSS only if every applicable command in that
+trial has a counter. A partial set of readings cannot establish the maximum;
+such a trial is excluded from that metric's distribution, whose `count` records
+only trials with complete coverage. Checkout controls have no scope-check peak.
 
 Pass `--build-features production` when measuring a binary built by
 `cargo build --locked --release` without extra features. Record non-default

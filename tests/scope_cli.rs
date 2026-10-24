@@ -8,6 +8,46 @@ use std::fs;
 use support::*;
 
 #[test]
+fn empty_baseline_intent_to_add_preserves_staged_deletion_violation() {
+    let fixture = Fixture::new();
+    git(&fixture.worktree, &["rm", "--cached", "outside-empty"]);
+    fixture.assert_check(&["outside-empty"], &["outside-empty"]);
+    git(
+        &fixture.worktree,
+        &["add", "--intent-to-add", "outside-empty"],
+    );
+    assert_eq!(
+        git(&fixture.worktree, &["diff", "--cached", "--name-status"]),
+        "D\toutside-empty"
+    );
+    let before = GitSnapshot::read(&fixture.worktree);
+    let source_before = GitSnapshot::read(&fixture.source);
+    fixture.assert_check(&["outside-empty"], &["outside-empty"]);
+    assert_eq!(GitSnapshot::read(&fixture.worktree), before);
+    assert_eq!(GitSnapshot::read(&fixture.source), source_before);
+    assert!(fs::read(fixture.worktree.join("outside-empty"))
+        .unwrap()
+        .is_empty());
+
+    fs::remove_file(fixture.worktree.join("outside-empty")).unwrap();
+    fixture.assert_check(&["outside-empty"], &["outside-empty"]);
+    assert_eq!(GitSnapshot::read(&fixture.worktree), before);
+    fs::write(fixture.worktree.join("outside-empty"), b"").unwrap();
+    fixture.assert_check(&["outside-empty"], &["outside-empty"]);
+    assert_eq!(GitSnapshot::read(&fixture.worktree), before);
+
+    fixture.scope(&["outside-empty"]);
+    fixture.assert_check(&[], &["outside-empty"]);
+    assert_eq!(GitSnapshot::read(&fixture.worktree), before);
+    assert_eq!(fixture.metadata()["creation_commit"], fixture.baseline);
+
+    // Normal staging removes the intent flag and restores the baseline index.
+    git(&fixture.worktree, &["add", "outside-empty"]);
+    fixture.assert_check(&[], &[]);
+    assert_eq!(GitSnapshot::read(&fixture.source), source_before);
+}
+
+#[test]
 fn intent_to_add_cli_keeps_violations_and_preserves_all_snapshots() {
     let fixture = Fixture::new();
     let names = [

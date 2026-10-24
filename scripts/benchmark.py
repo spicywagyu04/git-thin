@@ -337,7 +337,7 @@ def main():
         for number, worktree in enumerate(report["worktrees"], 1):
             destination = Path(worktree["path"])
             # Recheck before editing, so earlier worktree edits must not leak here.
-            verify_contents(destination, entries, object_format)
+            worktree["pre_edit_independence_verification_seconds"] = verify_contents(destination, entries, object_format)
             worktree["requested_edit_bytes"] = args.edit_bytes
             worktree["actual_edit_bytes"] = edit_fixture(destination, entries, args.edit_bytes, args.seed + number)
             report["measurements"].append({"phase": f"edited_{number}", **sync_and_measure(root)})
@@ -347,6 +347,11 @@ def main():
                 worktree["scope_check_wall_seconds"] = elapsed
                 worktree["scope_check_memory"] = memory
         report["source_independence_verification_seconds"] = verify_contents(source, entries, object_format)
+        report["total_independent_verification_seconds"] = report["source_independence_verification_seconds"] + sum(
+            worktree["independent_full_content_verification_seconds"]
+            + worktree["pre_edit_independence_verification_seconds"]
+            for worktree in report["worktrees"]
+        )
         report["status"] = "complete"
     except BaseException as error:
         report["status"] = "failed"

@@ -739,7 +739,12 @@ fn rejects_unsafe_scopes_without_creating_resources() {
 fn unsupported_clone_filesystem_never_falls_back_to_a_checkout() {
     let repo = Repo::new();
     let unsupported = match git_thin::backend::probe(&repo.source, &repo.parent) {
-        Ok(()) => return,
+        Ok(()) => {
+            eprintln!(
+                "INAPPLICABLE unsupported-clone rejection: this filesystem supports native cloning"
+            );
+            return;
+        }
         Err(error) if error.contains("native copy-on-write cloning is unsupported here") => error,
         Err(error) => panic!("unexpected probe failure: {error}"),
     };
@@ -835,7 +840,7 @@ fn non_utf8_source_paths_are_explicitly_rejected() {
     if let Err(error) = fs::write(repo.source.join(name), "non UTF-8 filename") {
         if error.raw_os_error() == Some(libc::EILSEQ) {
             eprintln!(
-                "SKIP non-UTF-8 source test: filesystem rejects non-UTF-8 filenames: {error}"
+                "INAPPLICABLE non-UTF-8 source test: filesystem rejects non-UTF-8 filenames: {error}"
             );
             return;
         }
@@ -1240,4 +1245,78 @@ fn apfs_case_rename_and_colliding_tree_paths_never_overwrite() {
         fs::read(repo.source.join("caf\u{e9}")).unwrap(),
         b"unicode baseline\n"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apfs_unicode_normalization_collisions_preserve_source_and_existing_refs() {
+    let repo = Repo::new();
+    if !repo.can_clone() {
+        return;
+    }
+    let composed = "caf\u{e9}";
+    let decomposed = "cafe\u{301}";
+    fs::write(repo.source.join(composed), b"unicode baseline\n").unwrap();
+    git(&repo.source, &["add", "--", composed]);
+    git(&repo.source, &["commit", "-m", "Unicode baseline"]);
+    let aliases = repo.source.join(decomposed).exists();
+    let oid = git(&repo.source, &["rev-parse", &format!("HEAD:{composed}")]).stdout;
+    let oid = String::from_utf8(oid).unwrap();
+    // Git normally precomposes argv paths on macOS. Disable that local
+    // convenience so the tree really contains the two distinct UTF-8 names.
+    git(&repo.source, &["config", "core.precomposeunicode", "false"]);
+    git(
+        &repo.source,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{},{}", oid.trim(), decomposed),
+        ],
+    );
+    if !aliases {
+        fs::write(repo.source.join(decomposed), b"unicode baseline\n").unwrap();
+    }
+    git(
+        &repo.source,
+        &["commit", "-m", "Normalization-colliding tree"],
+    );
+    let paths = git(&repo.source, &["ls-tree", "-z", "--name-only", "HEAD"]).stdout;
+    for name in [composed, decomposed] {
+        assert!(paths
+            .split(|byte| *byte == 0)
+            .any(|path| path == name.as_bytes()));
+    }
+    let head = git(&repo.source, &["rev-parse", "HEAD"]).stdout;
+    let index = fs::read(repo.source.join(".git/index")).unwrap();
+    let destination = repo.parent.join("unicode-collision");
+    let result = thin(
+        &repo.source,
+        &[
+            "add",
+            path(&destination),
+            "--branch",
+            "unicode-collision",
+            "--json",
+        ],
+    );
+    if aliases {
+        assert_eq!(result.status.code(), Some(2), "{}", describe(&result));
+        assert!(!destination.exists());
+    } else {
+        success(result);
+        assert_ne!(
+            fs::metadata(destination.join(composed)).unwrap().ino(),
+            fs::metadata(destination.join(decomposed)).unwrap().ino()
+        );
+    }
+    assert_eq!(git(&repo.source, &["rev-parse", "HEAD"]).stdout, head);
+    assert_eq!(fs::read(repo.source.join(".git/index")).unwrap(), index);
+    assert_eq!(git(&repo.source, &["rev-parse", "main"]).stdout, head);
+    for name in [composed, decomposed] {
+        assert_eq!(
+            fs::read(repo.source.join(name)).unwrap(),
+            b"unicode baseline\n"
+        );
+    }
 }

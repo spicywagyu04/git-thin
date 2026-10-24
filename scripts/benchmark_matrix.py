@@ -16,6 +16,15 @@ def distribution(values):
     return {"count": len(values), "median": statistics.median(values), "minimum": min(values), "maximum": max(values)} if values else {"count": 0}
 
 
+def complete_rss_peak(trees, field):
+    values = [tree.get(field, {}).get("peak_rss_bytes") for tree in trees]
+    # A maximum over a subset is only a lower bound on the trial's peak. Keep
+    # the entire peak unavailable when any applicable command lacks a counter.
+    if not values or any(type(value) is not int or value < 0 for value in values):
+        return None
+    return max(values)
+
+
 def summarize(trials, output, expected):
     groups = {}
     failures = []
@@ -49,13 +58,17 @@ def summarize(trials, output, expected):
             "clone_ms": sum(tree["clone_ms"] for tree in trees) if all("clone_ms" in tree for tree in trees) else None,
             "verification_ms": sum(tree["verification_ms"] for tree in trees) if all("verification_ms" in tree for tree in trees) else None,
             "independent_verification_seconds": sum(tree["independent_full_content_verification_seconds"] for tree in trees),
+            "pre_edit_independence_verification_seconds": sum(tree["pre_edit_independence_verification_seconds"] for tree in trees) if all("pre_edit_independence_verification_seconds" in tree for tree in trees) else None,
+            "source_independence_verification_seconds": report.get("source_independence_verification_seconds"),
             "scope_check_wall_seconds": sum(tree["scope_check_wall_seconds"] for tree in trees) if all("scope_check_wall_seconds" in tree for tree in trees) else None,
-            "creation_peak_rss_bytes": max((tree.get("creation_memory", {}).get("peak_rss_bytes") or 0 for tree in trees), default=0) or None,
-            "scope_peak_rss_bytes": max((tree.get("scope_check_memory", {}).get("peak_rss_bytes") or 0 for tree in trees), default=0) or None,
+            "creation_peak_rss_bytes": complete_rss_peak(trees, "creation_memory"),
+            "scope_peak_rss_bytes": complete_rss_peak(trees, "scope_check_memory"),
             "actual_edit_bytes": sum(tree["actual_edit_bytes"] for tree in trees),
             "filesystem_creation_delta_bytes": created["filesystem_used_bytes"] - source["filesystem_used_bytes"],
             "filesystem_edit_delta_bytes": edited["filesystem_used_bytes"] - created["filesystem_used_bytes"],
         }
+        independent_phases = [row[field] for field in ("independent_verification_seconds", "pre_edit_independence_verification_seconds", "source_independence_verification_seconds")]
+        row["total_independent_verification_seconds"] = sum(independent_phases) if all(value is not None for value in independent_phases) else None
         for field, earlier, later in (("apfs_creation_delta_bytes", source, created), ("apfs_edit_delta_bytes", created, edited)):
             before = earlier.get("apfs", {}).get("volume_capacity_in_use_bytes")
             after = later.get("apfs", {}).get("volume_capacity_in_use_bytes")
@@ -70,7 +83,7 @@ def summarize(trials, output, expected):
         "execution_contexts": contexts,
         "context_warning": "Reports have different platforms, Python/Git versions or measured binaries; do not combine them." if len(contexts) > 1 else None,
         "groups": {name: {field: distribution([row[field] for row in rows]) for field in rows[0]} for name, rows in groups.items()},
-        "limitations": ["Each observation is a trial total across its worktrees, except memory, which is the largest reported command RSS.", "Filesystem deltas include metadata and background activity; they do not identify exact shared extents.", "An absent APFS counter is unavailable, never zero.", "Review raw reports for identical build, settings, cache conditions and fixture parameters before comparing trials."],
+        "limitations": ["Timing observations aggregate each phase across the trial; source verification runs once. Total independent verification includes post-creation, pre-edit and final source passes, excluding internal tool verification and scope checking.", "Memory is the largest command RSS only when every applicable command in the trial has a counter; otherwise the trial peak is unavailable.", "Filesystem deltas include metadata and background activity; they do not identify exact shared extents.", "Absent counters and older reports without all verification phases are unavailable, never zero.", "Review raw reports for identical build, settings, cache conditions and fixture parameters before comparing trials."],
     }
 
 

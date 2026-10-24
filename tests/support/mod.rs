@@ -112,6 +112,7 @@ impl Fixture {
             fs::create_dir(source.join("allowed")).unwrap();
             fs::write(source.join("allowed/file"), "allowed baseline\n").unwrap();
             fs::write(source.join("outside"), "outside baseline\n").unwrap();
+            fs::write(source.join("outside-empty"), b"").unwrap();
             fs::write(source.join(".gitignore"), "build/\n").unwrap();
             git(&source, &["add", "."]);
         }
