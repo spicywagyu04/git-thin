@@ -1,9 +1,10 @@
 # Reproducible storage benchmarks
 
-No storage-saving or performance result has been published by this repository.
-The harness records observations from a real filesystem. An APFS run is required
-before making claims about macOS storage savings. A successful Linux run cannot
-substitute for that evidence.
+The [measured APFS results](measurements.md) record twelve controlled-volume
+trials, including the observed storage and creation-time tradeoff. The harness
+records observations from a real filesystem; these APFS measurements do not
+establish Linux performance or exact shared-extent accounting. Follow this
+procedure to repeat the experiment on another configuration.
 
 ## Prepare an isolated filesystem
 
@@ -96,15 +97,105 @@ The JSON includes:
 | `creation_wall_seconds` | Complete `add` or ordinary Git checkout elapsed time |
 | `creation_result` | Unmodified structured git-thin output, including phase timings when provided |
 | `clone_ms`, `verification_ms` | git-thin's own clone and creation-verification phase durations |
-| `independent_full_content_verification_seconds` | Separate full read/hash of the completed worktree |
+| `independent_full_content_verification_seconds` | Separate full read/hash immediately after creating each worktree |
+| `pre_edit_independence_verification_seconds` | Additional full read/hash immediately before editing each worktree, proving earlier edits did not leak into it |
 | `scope_check_wall_seconds` | Final-state scope check after edits; distinct from creation verification |
 | `measurements` | Synchronized allocation-counter snapshots before source creation, after commit, after each worktree, and after edits |
 | `actual_edit_bytes` | Number of bytes written by the controlled editing pass |
 | `source_independence_verification_seconds` | Full hash verification that source content remained unchanged |
+| `total_independent_verification_seconds` | Sum of the post-creation and pre-edit passes for every worktree, plus the final source pass; excludes the tool's internal verification and scope checking |
+| `creation_memory`, `scope_check_memory` | Per-command peak resident bytes from macOS `time -l` or Linux `time -v`, with raw output and unavailable counters explicitly identified |
+| `binary`, `tool_commit`, `tool_checkout_status` | Exact binary SHA-256, declared build features, source commit, and uncommitted changes; a commit alone cannot identify a dirty candidate |
+| `environment_notes` | Operator-supplied hardware, filesystem, snapshot, encryption/compression, cache and background-activity notes |
 
 Creation time includes git-thin's own mandatory content verification. The
 independent verification measurement is an additional pass; do not subtract it
 from creation time or call the scope check a full creation verification.
+The pre-edit pass is also timed and reported separately. The total independent
+verification field accounts for all harness verification passes without adding
+them to creation wall time. Older reports lack the pre-edit duration; their total
+cannot be reconstructed and remains unavailable in matrix summaries.
+Memory is the high-water RSS returned by the platform's `time` command, not a
+sum of simultaneous parent/child resident memory. It excludes the Python
+harness's independent verification pass. Measurement files live beside the
+report, outside the benchmark fixture. Missing memory counters are unavailable,
+not zero. Reports use schema version 2; earlier reports lack these counters.
+The matrix reports a trial's peak RSS only if every applicable command in that
+trial has a counter. A partial set of readings cannot establish the maximum;
+such a trial is excluded from that metric's distribution, whose `count` records
+only trials with complete coverage. Checkout controls have no scope-check peak.
+
+Pass `--build-features production` when measuring a binary built by
+`cargo build --locked --release` without extra features. Record non-default
+features accurately. Use `--environment-notes /path/to/notes.json` for a JSON
+object describing the conditions above. The harness captures platform, CPU
+architecture/count, Git/Rust/Python versions, and source identity automatically,
+but cannot infer whether unrelated writers, snapshots or warm caches influenced
+the run. Unspecified conditions remain an explicit report limitation.
+
+## Randomized matrices and manageable scaling probes
+
+`scripts/benchmark_matrix.py` produces a repeatable shuffled order for both
+layouts, both methods and three repetitions (twelve trials). Without `--run`, it
+prints the plan and aggregate capacity requirement without creating anything:
+
+```sh
+python3 scripts/benchmark_matrix.py /Volumes/ThinBench \
+  --output-dir /path/on/another/volume/reports --git-thin "$THIN_BIN" \
+  --build-features production --environment-notes /path/to/notes.json
+```
+
+Add `--run` to execute every trial while retaining every fixture. At default
+parameters this requires **432 GB plus twelve 1 GiB reserves**, because the
+individual 24/48 GB budgets cannot be reused while trial data remains. The
+driver refuses insufficient aggregate capacity. The single-trial harness also
+adds a default 1 GiB reserve beyond its fixture estimate; adjust
+`--reserve-bytes` explicitly for small smoke tests.
+
+On a smaller dedicated filesystem, execute `--trial 1 --run`, preserve its
+report, then deliberately detach and reset only that disposable image before
+`--trial 2 --run`, continuing in the printed order. Keep the mountpoint,
+parameters, seed, binary, and filesystem settings consistent. The driver never
+resets or deletes a fixture. Existing fixture/report paths are errors, and a
+failed trial stops the run while retaining its partial report. A single trial
+prints an incomplete summary until the other reports exist.
+
+After all trials, generate medians and ranges from the retained raw reports:
+
+```sh
+python3 scripts/benchmark_matrix.py /Volumes/ThinBench \
+  --output-dir /path/on/another/volume/reports --git-thin "$THIN_BIN" \
+  --build-features production --summarize-only > /path/to/matrix-summary.json
+```
+
+Use the same parameter arguments when summarizing; mismatching reports are
+failures, not accepted members of the matrix. Each timing observation is the
+total for all worktrees in one trial. Memory is the maximum reported command
+RSS within that trial. Allocation summaries preserve the distinction between
+general filesystem counters and APFS volume counters. Always retain raw reports
+and inspect their settings; a numeric summary alone does not establish a fair
+comparison or an exact shared-extent saving.
+
+Before a full matrix, smoke-test all four combinations with a 1 MiB fixture,
+then increase file count at a manageable total byte size:
+
+```sh
+python3 scripts/benchmark_matrix.py /Volumes/ThinBench \
+  --output-dir /path/to/smoke-reports --git-thin "$THIN_BIN" \
+  --build-features production --bytes 1048576 --edit-bytes 4096 \
+  --worktrees 2 --repetitions 1 --reserve-bytes 16777216 --run
+
+python3 scripts/benchmark.py /Volumes/ThinBench/scaling-4096-files \
+  --output /path/to/scaling-4096-files.json --git-thin "$THIN_BIN" \
+  --build-features production --layout small --bytes 16777216 \
+  --small-file-bytes 4096 --edit-bytes 4096 --run
+```
+
+Repeat the scaling probe with larger file sizes at the same total bytes to
+isolate file-count costs. Include scope-check timings and memory; mandatory
+per-file content verification may dominate cloning time. These small probes
+and CI smoke matrices do not satisfy the twelve default-size APFS trials.
+Quantitative Linux claims require the corresponding Linux measurements.
 
 Compare the `source_committed` snapshot with `created_1`, `created_2`, and
 `created_3` to observe incremental allocation. Compare `created_3` with each

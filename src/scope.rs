@@ -317,7 +317,11 @@ fn working_changes(
                 continue;
             }
             let target = crate::backend::read_symlink(root, &entry.path)?;
-            crate::git::hash_reader(root, &mut target.as_os_str().as_bytes())?
+            crate::git::hash_reader(
+                &entry.oid,
+                target.as_os_str().as_bytes().len() as u64,
+                &mut target.as_os_str().as_bytes(),
+            )?
         } else {
             if !metadata.is_file() {
                 changed.insert(path.to_owned());
@@ -335,7 +339,13 @@ fn working_changes(
                 changed.insert(path.to_owned());
                 continue;
             }
-            crate::git::hash_reader(root, &mut file)?
+            crate::git::hash_reader(
+                &entry.oid,
+                file.metadata()
+                    .map_err(|error| format!("cannot inspect working file {path:?}: {error}"))?
+                    .len(),
+                &mut file,
+            )?
         };
         if actual != entry.oid {
             changed.insert(path.to_owned());
@@ -389,14 +399,22 @@ pub fn check(root: &Path, baseline: &str, entries: &[ScopeEntry]) -> Result<Chec
         "compare committed changes with the creation commit",
     )?;
     add_paths(&mut changed, &head.stdout)?;
-    let index = run(
-        command(root)
-            .arg("diff")
-            .args(diff_options)
-            .args(["--cached", baseline, "--"]),
-        "compare staged changes with the creation commit",
-    )?;
-    add_paths(&mut changed, &index.stdout)?;
+    // Both index views are needed: visible intent-to-add entries expose new
+    // additions, while invisible entries preserve staged deletions of baseline
+    // files whose empty blobs would otherwise match the intent-to-add entries.
+    // Both options are supported by the minimum Git version (2.39).
+    for intent_view in ["--ita-visible-in-index", "--ita-invisible-in-index"] {
+        let index = run(
+            command(root).arg("diff").args(diff_options).args([
+                "--cached",
+                intent_view,
+                baseline,
+                "--",
+            ]),
+            "compare staged changes with the creation commit",
+        )?;
+        add_paths(&mut changed, &index.stdout)?;
+    }
 
     working_changes(root, &baseline_entries, &mut changed)?;
 
@@ -435,6 +453,11 @@ mod tests {
         let output = Command::new("git")
             .current_dir(root)
             .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         assert!(
@@ -446,7 +469,7 @@ mod tests {
     }
 
     fn repository() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         git(dir.path(), &["init", "-q"]);
         git(dir.path(), &["config", "user.name", "Scope Test"]);
         git(
@@ -627,6 +650,163 @@ mod tests {
                 .violations,
             ["new-staged", "outside"]
         );
+    }
+
+    #[test]
+    fn empty_baseline_intent_to_add_cannot_hide_staged_deletions() {
+        let (dir, _) = repository();
+        let names = ["allowed/empty", "outside-empty", "-empty\t雪\nfile"];
+        for name in names {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        git(
+            dir.path(),
+            &[
+                "add",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        git(dir.path(), &["commit", "-qm", "empty baseline files"]);
+        let baseline = git(dir.path(), &["rev-parse", "HEAD"]);
+        git(
+            dir.path(),
+            &[
+                "rm",
+                "--cached",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        git(
+            dir.path(),
+            &[
+                "add",
+                "--intent-to-add",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        let before = fs::read(dir.path().join(".git/index")).unwrap();
+        let result = check(dir.path(), &baseline, &allowed(dir.path())).unwrap();
+        assert_eq!(result.violations, ["-empty\t雪\nfile", "outside-empty"]);
+        assert_eq!(
+            result.changed_paths,
+            ["-empty\t雪\nfile", "allowed/empty", "outside-empty"]
+        );
+        assert_eq!(fs::read(dir.path().join(".git/index")).unwrap(), before);
+        assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), baseline);
+        for name in names {
+            assert!(fs::read(dir.path().join(name)).unwrap().is_empty());
+        }
+        git(
+            dir.path(),
+            &[
+                "add",
+                "--",
+                "allowed/empty",
+                "outside-empty",
+                "-empty\t雪\nfile",
+            ],
+        );
+        let restored = check(dir.path(), &baseline, &allowed(dir.path())).unwrap();
+        assert!(restored.clean);
+        assert!(restored.changed_paths.is_empty());
+    }
+
+    #[test]
+    fn intent_to_add_is_a_change_even_when_the_working_file_disappears() {
+        let (dir, baseline) = repository();
+        for name in ["empty-new", "outside-new", "allowed/new", "-new\t雪\nfile"] {
+            let bytes = if name == "empty-new" {
+                ""
+            } else {
+                "new bytes\n"
+            };
+            fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let expected = ["-new\t雪\nfile", "empty-new", "outside-new"];
+        assert_eq!(
+            check(dir.path(), &baseline, &allowed(dir.path()))
+                .unwrap()
+                .violations,
+            expected
+        );
+        git(
+            dir.path(),
+            &[
+                "add",
+                "--intent-to-add",
+                "--",
+                "empty-new",
+                "outside-new",
+                "allowed/new",
+                "-new\t雪\nfile",
+            ],
+        );
+        let index_before = fs::read(dir.path().join(".git/index")).unwrap();
+        let head_before = git(dir.path(), &["rev-parse", "HEAD"]);
+        let report = check(dir.path(), &baseline, &allowed(dir.path())).unwrap();
+        assert_eq!(report.violations, expected);
+        assert!(report.changed_paths.contains(&"allowed/new".to_owned()));
+        assert_eq!(
+            fs::read(dir.path().join(".git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("outside-new")).unwrap(),
+            "new bytes\n"
+        );
+
+        // The index snapshot still contains an intended addition after its
+        // working file disappears. It remains changed until reset as well.
+        fs::remove_file(dir.path().join("outside-new")).unwrap();
+        assert_eq!(
+            check(dir.path(), &baseline, &allowed(dir.path()))
+                .unwrap()
+                .violations,
+            expected
+        );
+        assert_eq!(
+            fs::read(dir.path().join(".git/index")).unwrap(),
+            index_before
+        );
+        git(
+            dir.path(),
+            &["add", "--", "empty-new", "allowed/new", "-new\t雪\nfile"],
+        );
+        assert_eq!(
+            check(dir.path(), &baseline, &allowed(dir.path()))
+                .unwrap()
+                .violations,
+            expected
+        );
+        git(
+            dir.path(),
+            &[
+                "reset",
+                "-q",
+                "HEAD",
+                "--",
+                "empty-new",
+                "outside-new",
+                "allowed/new",
+                "-new\t雪\nfile",
+            ],
+        );
+        for name in ["empty-new", "allowed/new", "-new\t雪\nfile"] {
+            fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        let restored = check(dir.path(), &baseline, &allowed(dir.path())).unwrap();
+        assert!(restored.clean);
+        assert!(restored.changed_paths.is_empty());
     }
 
     #[test]
@@ -818,7 +998,7 @@ mod tests {
         if let Err(error) = fs::write(dir.path().join(OsStr::from_bytes(b"nonutf8-\xff")), "new") {
             if error.raw_os_error() == Some(libc::EILSEQ) {
                 eprintln!(
-                    "SKIP non-UTF-8 scope test: filesystem rejects non-UTF-8 filenames: {error}"
+                    "INAPPLICABLE non-UTF-8 scope test: filesystem rejects non-UTF-8 filenames: {error}"
                 );
                 return;
             }
